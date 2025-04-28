@@ -16,28 +16,31 @@
 #include "def.h"
 #include "fastcdc.h"
 
+// iNumber management
+std::set<INUM_TYPE> free_iNum;
 PATH_TYPE iNum_to_path[MAX_INODE_NUM];
 std::unordered_map<PATH_TYPE, INUM_TYPE> path_to_iNum;
-std::set<INUM_TYPE> free_iNum;
-std::unordered_map<FP_TYPE, group_addr *> fp_store;
+// file handler
 std::set<FILE_HANDLER_INDEX_TYPE> free_file_handler;
 file_handler_data file_handler[MAX_FILE_HANDLER];   // get iNum by file handler (faster than get by file path)
+// fingerprint store
+std::unordered_map<FP_TYPE, group_addr *> fp_store;
+// mapping table
 mapping_table_entry mapping_table[MAX_INODE_NUM];
-
+// file system stat record
+unsigned long total_write_size = 0;     // total size of writed file in this file system
+unsigned long total_dedup_size = 0;     // total size of writed file in this file system after deduplication
+uint64_t host_read_size = 0;
+uint64_t fuse_read_size = 0;
+uint64_t ssd_read_size = 0;
+// lock
 std::shared_mutex create_file_mutex;    // the lock for create new file
 std::shared_mutex fp_store_mutex;       // the lock for access fp_store
 std::shared_mutex file_handler_mutex;   // the lock for allocate file handler and free file handler
 std::shared_mutex status_record_mutex;  // the lock for recording file system status
 std::shared_mutex chunker_mutex;        // the lock for access chunker
 std::shared_mutex read_record_mutex;    // the lock for record host/fuse/ssd read size
-
-unsigned long total_write_size = 0;     // total size of writed file in this file system
-unsigned long total_dedup_size = 0;     // total size of writed file in this file system after deduplication
-
-uint64_t host_read_size = 0;
-uint64_t fuse_read_size = 0;
-uint64_t ssd_read_size = 0;
-
+// fastCDC chunker
 fcdc_ctx cdc, *ctx;
 
 inline INUM_TYPE get_inum(PATH_TYPE path_str){
@@ -140,10 +143,10 @@ static int dedupfs_open(const char *path, struct fuse_file_info *fi) {
     snprintf(full_path, sizeof(full_path), "%s%s", BACKEND, path);
     real_file_handler = open(full_path, fi->flags);
     if (real_file_handler == -1)
-        return -errno;
+        return -1;
     fi->fh = get_free_file_handler();
-    if (fi->fh == (FILE_HANDLER_INDEX_TYPE)-1)
-        return -errno;
+    if (fi->fh == -1ULL)
+        return -1;
     char mode = fi->flags & (O_WRONLY | O_RDWR) ? 'w' : 'r';
     DEBUG_MESSAGE("mode: " << mode);
     init_file_handler(path, fi->fh, real_file_handler, mode);
@@ -151,9 +154,8 @@ static int dedupfs_open(const char *path, struct fuse_file_info *fi) {
 }
 
 static int cdcfs_release(const char *path, struct fuse_file_info *fi) {
-    int res;
     DEBUG_MESSAGE("[release]" << path);
-
+    int res;
     INUM_TYPE iNum = file_handler[fi->fh].iNum;
     buffer_entry *file_buffer = &file_handler[fi->fh].write_buf;
 
@@ -436,18 +438,19 @@ static int cdcfs_read(const char *path, char *buf, size_t size, off_t offset, st
 
 static int cdcfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
     DEBUG_MESSAGE("[write]" << path << " offset: " << offset << " size: " << size);
-
     INUM_TYPE iNum = file_handler[fi->fh].iNum;
     buffer_entry *in_buffer_data = &file_handler[fi->fh].write_buf;
-
-    if (in_buffer_data->start_byte > 0 && in_buffer_data->start_byte + in_buffer_data->byte_cnt != offset) {     // file buffer is not empty and current write is not continous.
-        PRINT_WARNING("write: detect not continous write in write buffer");
-        return -errno;
+    if (in_buffer_data->byte_cnt > 0) { // buffer is not empty
+        if (in_buffer_data->start_byte + in_buffer_data->byte_cnt != offset){
+            PRINT_WARNING("write: detect not continous write in write buffer");
+            return -1;
+        }
     }
-
-    if (offset < (long int)mapping_table[iNum].actual_size_in_disk + in_buffer_data->byte_cnt) {
-        PRINT_WARNING("write: currently not support data update.");
-        return -errno;
+    else{
+        if (mapping_table[iNum].actual_size_in_disk != offset){
+            PRINT_WARNING("write: currently not support data update.");
+            return -errno;
+        }
     }
 
     if (in_buffer_data->byte_cnt == 0) in_buffer_data->start_byte = offset;
