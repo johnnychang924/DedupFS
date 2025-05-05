@@ -9,22 +9,22 @@ static int dedupfs_utime(const char *path, struct utimbuf *ubuf) {
     return utime(full_path, ubuf);
 }
 
-static int dedupfs_unlink(const char *path) {
+/*static int dedupfs_unlink(const char *path) {
     DEBUG_MESSAGE("unlink: " << path);
     char full_path[1024];
     snprintf(full_path, sizeof(full_path), "%s%s", BACKEND, path);
     return unlink(full_path);
-}
+}*/
 
 static int dedupfs_readlink(const char *path, char *buf, size_t size) {
-    DEBUG_MESSAGE("[readlink]" << full_path);
+    DEBUG_MESSAGE("[readlink]" << path);
     char full_path[1024];
     snprintf(full_path, sizeof(full_path), "%s%s", BACKEND, path);
     return readlink(full_path, buf, size - 1);
 }
 
 static int dedupfs_link(const char *oldpath, const char *newpath) {
-    DEBUG_MESSAGE("[link]" << "dest: " << full_new << " src: " << full_old);
+    DEBUG_MESSAGE("[link]" << "dest: " << newpath << " src: " << oldpath);
     char full_old[1024];
     char full_new[1024];
     snprintf(full_old, sizeof(full_old), "%s%s", BACKEND, oldpath);
@@ -33,7 +33,7 @@ static int dedupfs_link(const char *oldpath, const char *newpath) {
 }
 
 static int dedupfs_symlink(const char *oldpath, const char *newpath) {
-    DEBUG_MESSAGE("[symlink]" << "dest" << full_new << " src: " << full_old);
+    DEBUG_MESSAGE("[symlink]" << "dest" << newpath << " src: " << oldpath);
     char full_old[1024];
     char full_new[1024];
     snprintf(full_old, sizeof(full_old), "%s%s", BACKEND, oldpath);
