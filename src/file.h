@@ -185,24 +185,28 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
         if (start_group_idx < 0 || start_group_idx >= mapping_table[iNum].group_pos.size()) return 0;   // It should not happen
     }
     DEBUG_MESSAGE("  start block: " << start_group_idx);
-    // find last block group index
+    // find need to read range
     int less = size;
-    GROUP_IDX_TYPE end_group_idx = start_group_idx-1; // included
-    while(less > 0){
-        end_group_idx++;
-        off_t front_gap = offset - std::min(offset, mapping_table[iNum].group_logical_offset[end_group_idx]);
-        less -= mapping_table[iNum].group_pos[end_group_idx].length - front_gap;
-        if (end_group_idx == mapping_table[iNum].group_pos.size()-1) break;
-    }
-    DEBUG_MESSAGE("  end block " << end_group_idx);
-    // read into temp buffer
     off_t io_off = mapping_table[iNum].group_virtual_offset[start_group_idx];
-    size_t io_size = mapping_table[iNum].group_virtual_offset[end_group_idx] + mapping_table[iNum].group_pos[end_group_idx].length - io_off;
+    off_t io_end = mapping_table[iNum].group_virtual_offset[start_group_idx] + 1; // not included
+    GROUP_IDX_TYPE cur_group_idx = start_group_idx;
+    bool first_group = true;
+    while(less > 0){
+        off_t front_gap = first_group ? offset - mapping_table[iNum].group_logical_offset[cur_group_idx] : 0;
+        first_group = false;
+        io_off = std::min(io_off, mapping_table[iNum].group_virtual_offset[cur_group_idx]);
+        io_end = std::max(io_end, mapping_table[iNum].group_virtual_offset[cur_group_idx] + (off_t)mapping_table[iNum].group_pos[cur_group_idx].length);
+        less -= mapping_table[iNum].group_pos[cur_group_idx].length - front_gap;
+        cur_group_idx++;
+        if (cur_group_idx >= mapping_table[iNum].group_pos.size()) break;
+    }
+    size_t io_size = io_end - io_off;
+    // read into temp buffer
     unique_read_record_lock.lock();
     fuse_read_size += io_size;
     unique_read_record_lock.unlock();
     char tmp_buf[io_size];
-    DEBUG_MESSAGE("start reading offset->" << io_off << " size->" << io_size);
+    DEBUG_MESSAGE("  start reading offset->" << io_off << " size->" << io_size);
     int res = pread(file_handler[fi->fh].fh, tmp_buf, io_size, io_off);
     if ((size_t)res != io_size){
         PRINT_WARNING("Can not read enough chunk from virtual file, should read " << io_size << ", but " << res);
@@ -210,11 +214,19 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     // fill in return buffer
     less = size;
     char *cur_buf_ptr = buf;
-    GROUP_IDX_TYPE cur_group_idx = start_group_idx;
+    cur_group_idx = start_group_idx;
+    DEBUG_MESSAGE("  filling return buffer");
+    first_group = true;
     while(less > 0){
-        off_t front_gap = offset - std::min(offset, mapping_table[iNum].group_logical_offset[cur_group_idx]);
+        off_t front_gap = 0;
+        if (first_group){
+            front_gap = offset - mapping_table[iNum].group_logical_offset[cur_group_idx];
+            first_group = false;
+        }
         size_t cp_size = std::min(mapping_table[iNum].group_pos[cur_group_idx].length - front_gap, (size_t)less);
-        memcpy(cur_buf_ptr, tmp_buf + mapping_table[iNum].group_virtual_offset[cur_group_idx] - io_off + front_gap, cp_size);
+        off_t tmp_buf_off = mapping_table[iNum].group_virtual_offset[cur_group_idx] - io_off + front_gap;
+        DEBUG_MESSAGE("    cur_group->" << cur_group_idx << " front_gap->" << front_gap << " cp_size->" << cp_size << " group_offset->" << mapping_table[iNum].group_virtual_offset[cur_group_idx] << " group_size->" << mapping_table[iNum].group_pos[cur_group_idx].length << " tmp_buffer_offset->" << tmp_buf_off);
+        memcpy(cur_buf_ptr, tmp_buf + tmp_buf_off, cp_size);
         less -= cp_size;
         if (cur_group_idx == mapping_table[iNum].group_pos.size()-1) break;
         cur_buf_ptr += cp_size;
@@ -298,9 +310,9 @@ static int dedupfs_release(const char *path, struct fuse_file_info *fi){
             snprintf(full_path, sizeof(full_path), "%s%s%s", BACKEND, CHUNK_STORE, iNum_to_path[group_iNum].c_str());
             fh_cache[group_iNum] = open(full_path, O_RDONLY);
         }
-        size_t front_userless_size = mapping_table[iNum].group_pos[cur_group_idx].offset % SECTOR_SIZE;
-        off_t src_offset = mapping_table[iNum].group_pos[cur_group_idx].offset - front_userless_size;
-        size_t length = (mapping_table[iNum].group_pos[cur_group_idx].length + front_userless_size + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE;  // alligned with sector size
+        size_t front_useless_size = mapping_table[iNum].group_pos[cur_group_idx].offset % SECTOR_SIZE;
+        off_t src_offset = mapping_table[iNum].group_pos[cur_group_idx].offset - front_useless_size;
+        size_t length = (mapping_table[iNum].group_pos[cur_group_idx].length + front_useless_size + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE;  // alligned with sector size
         bool use_same_sector = false;
         if (group_iNum == pre_iNum && src_offset / SECTOR_SIZE == pre_last_sector){
             length -= SECTOR_SIZE;
@@ -322,9 +334,9 @@ static int dedupfs_release(const char *path, struct fuse_file_info *fi){
             }
         }
         if (use_same_sector)
-            mapping_table[iNum].group_virtual_offset.push_back(mapping_table[iNum].real_size + front_userless_size - SECTOR_SIZE);
+            mapping_table[iNum].group_virtual_offset.push_back(mapping_table[iNum].real_size + front_useless_size - SECTOR_SIZE);
         else
-            mapping_table[iNum].group_virtual_offset.push_back(mapping_table[iNum].real_size + front_userless_size);
+            mapping_table[iNum].group_virtual_offset.push_back(mapping_table[iNum].real_size + front_useless_size);
         mapping_table[iNum].real_size += length;
         mapping_table[iNum].completed_link++;
         pre_iNum = group_iNum;
