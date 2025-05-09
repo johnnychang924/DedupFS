@@ -121,6 +121,7 @@ static int dedupfs_getattr(const char *path, struct stat *stbuf) {
     if (it != path_to_iNum.end()){
         INUM_TYPE iNum = it->second;
         stbuf->st_size = mapping_table[iNum].logical_size;
+        stbuf->st_blocks = (mapping_table[iNum].logical_size + 511) / 512;
     }
     shared_create_file_lock.unlock();
     return 0;
