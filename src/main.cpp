@@ -17,6 +17,7 @@ static void dedupfs_leave(void *param){
     PRINT_MESSAGE("host read size(GB): " << (float)host_read_size / 1000000000 << "GB");
     PRINT_MESSAGE("FUSE read size: " << fuse_read_size);
     PRINT_MESSAGE("FUSE read size(GB): " << (float)fuse_read_size / 1000000000 << "GB");
+    PRINT_MESSAGE("read amplication: " << (float)fuse_read_size / host_read_size << " %");
 }
 
 static struct fuse_operations dedupfs_oper = {
