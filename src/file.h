@@ -30,8 +30,8 @@ std::unordered_map<FP_TYPE, hash_store_entry> fp_store;
 // mapping table
 mapping_table_entry mapping_table[MAX_INODE_NUM];
 // file system stat record
-unsigned long total_write_size = 0;     // total size of writed file in this file system
-unsigned long real_write_size = 0;      // total size of writed file in this file system after deduplication
+uint64_t total_write_size = 0;     // total size of writed file in this file system
+uint64_t real_write_size = 0;      // total size of writed file in this file system after deduplication
 uint64_t host_read_size = 0;
 uint64_t fuse_read_size = 0;
 // lock
@@ -184,7 +184,7 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     DEBUG_MESSAGE("  start block: " << start_group_idx);
     // find need to read range
     off_t end_off = offset + size;
-    off_t io_off = mapping_table[iNum].group_virtual_offset[start_group_idx] / SECTOR_SIZE * SECTOR_SIZE;
+    off_t io_off = mapping_table[iNum].group_virtual_offset[start_group_idx] / SECTOR_SIZE * SECTOR_SIZE;   // allign with page
     GROUP_IDX_TYPE cur_group_idx = start_group_idx;
     off_t front_gap = offset - mapping_table[iNum].group_logical_offset[cur_group_idx];
     while(cur_group_idx < mapping_table[iNum].group_logical_offset.size() && 
@@ -192,6 +192,7 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
         cur_group_idx++;
     cur_group_idx -= 1;
     size_t io_size = mapping_table[iNum].group_virtual_offset[cur_group_idx] + (off_t)mapping_table[iNum].group_pos[cur_group_idx].length - io_off;
+    io_size = (io_size + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE;  // allign with page
     // read into temp buffer
     char tmp_buf[io_size];
     DEBUG_MESSAGE("  start reading offset->" << io_off << " size->" << io_size);

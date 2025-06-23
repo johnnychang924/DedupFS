@@ -18,7 +18,7 @@
 #define MAX_FILE_HANDLER 4096
 
 // type define
-#define INUM_TYPE unsigned long
+#define INUM_TYPE uint32_t
 #define FP_TYPE std::string
 #define PATH_TYPE std::string
 #define FILE_HANDLER_INDEX_TYPE uint32_t
