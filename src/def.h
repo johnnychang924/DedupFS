@@ -5,6 +5,9 @@
 #ifndef DEF_H
 #define DEF_H
 
+// pending
+// #define PENDING
+
 // DedupFS user setting
 #define BACKEND "/home/johnnychang/Projects/CDC-dedup/helper/bak"
 #define CHUNK_STORE "/chunk_store"
@@ -37,24 +40,24 @@ struct hash_store_entry{
 struct mapping_table_entry{
     std::vector<GROUP_IDX_TYPE> group_idx;              // the group index of each "BLOCK"
     std::vector<off_t> group_logical_offset;            // the logical start byte of every group in this file
-    std::vector<off_t> group_virtual_offset;               // the real start byte of every group in this file
-    std::vector<chunk_addr> group_pos;                  // The position of every Group
-    GROUP_IDX_TYPE completed_link = 0;                  // how mant group has been linked to the real file
-    size_t chunk_store_size = 0;                        // how many size has been used in chunk store
+    std::vector<off_t> group_virtual_offset;            // the virtual start byte of every group in this file
+    std::vector<chunk_addr> group_pos;                  // The real position of every Group
+    GROUP_IDX_TYPE completed_link = 0;                  // how mant group has been linked to the virtual file
     size_t logical_size = 0;                            // the file size host will see(before dedup)
-    size_t real_size = 0;                               // how many chunk have been reflink into real file(in bytes)
+    size_t virtual_size = 0;                            // how many chunk have been reflink into virtual file(in bytes)
+    size_t real_size = 0;                               // how many size has been used in real file
 };
 struct buffer_entry{
-    off_t start_byte;   // which bytes to start
-    uint16_t byte_cnt;  // how many bytes in buffer
+    off_t start_byte;       // which bytes to start
+    uint16_t byte_cnt;      // how many bytes in buffer
     char *content = NULL;   // the content
 };
 struct file_handler_data{
-    INUM_TYPE iNum;     // the inum of this file
-    int fh;             // the file descriptor of the file
-    int csfh;           // the file descriptor of chunk store
-    char mode;          // the mode of open('r' | 'w')
-    buffer_entry write_buf;  // the buffer use for write operation.
+    INUM_TYPE iNum;             // the inum of this file
+    int fh;                     // the file descriptor of the file
+    int csfh;                   // the file descriptor of chunk store
+    char mode;                  // the mode of open('r' | 'w')
+    buffer_entry write_buf;     // the buffer use for write operation.
 };
 
 // message output macro

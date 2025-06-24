@@ -141,6 +141,9 @@ static int dedupfs_create(const char *path, mode_t mode, struct fuse_file_info *
     fi->fh = get_free_file_handler();
     if (fi->fh == (FILE_HANDLER_INDEX_TYPE)-1) return -errno;
     init_file_handler(path, fi->fh, real_file_handler, chunk_store_file_handler, 'w');
+    // force real file to shift
+    // mapping_table[file_handler[fi->fh].iNum].real_size += 512;
+    // ftruncate(chunk_store_file_handler, mapping_table[fi->fh].real_size);
     return 0;
 }
 
@@ -184,14 +187,17 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     DEBUG_MESSAGE("  start block: " << start_group_idx);
     // find need to read range
     off_t end_off = offset + size;
-    off_t io_off = mapping_table[iNum].group_virtual_offset[start_group_idx] / SECTOR_SIZE * SECTOR_SIZE;   // allign with page
+    off_t front_gap = offset - mapping_table[iNum].group_logical_offset[start_group_idx];
+    off_t io_off = (mapping_table[iNum].group_virtual_offset[start_group_idx] + front_gap) / SECTOR_SIZE * SECTOR_SIZE;
     GROUP_IDX_TYPE cur_group_idx = start_group_idx;
-    off_t front_gap = offset - mapping_table[iNum].group_logical_offset[cur_group_idx];
     while(cur_group_idx < mapping_table[iNum].group_logical_offset.size() && 
                 mapping_table[iNum].group_logical_offset[cur_group_idx] < end_off)
         cur_group_idx++;
     cur_group_idx -= 1;
-    size_t io_size = mapping_table[iNum].group_virtual_offset[cur_group_idx] + (off_t)mapping_table[iNum].group_pos[cur_group_idx].length - io_off;
+    off_t end_gap = mapping_table[iNum].group_logical_offset[cur_group_idx] + mapping_table[iNum].group_pos[cur_group_idx].length - end_off;
+    if (end_gap < 0)
+        end_gap = 0;
+    size_t io_size = mapping_table[iNum].group_virtual_offset[cur_group_idx] + (off_t)mapping_table[iNum].group_pos[cur_group_idx].length - end_gap - io_off;
     io_size = (io_size + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE;  // allign with page
     // read into temp buffer
     char tmp_buf[io_size];
@@ -253,15 +259,26 @@ inline int flush_buffer(buffer_entry *buf, INUM_TYPE iNum, int csfh){       // r
         mapping_table[iNum].group_pos.push_back(fp_store_iter->second.address);
     }
     else{   // not found
-        int res = pwrite(csfh, buf->content, cut_pos, mapping_table[iNum].chunk_store_size);
+        #ifdef PENDING
+        int pending_size = (buf->start_byte % SECTOR_SIZE) - (mapping_table[iNum].real_size % SECTOR_SIZE);
+        if (pending_size < 0)
+            pending_size += SECTOR_SIZE;
+        if (pending_size != 0){
+            mapping_table[iNum].real_size += pending_size;
+            ftruncate(csfh, mapping_table[iNum].real_size);
+        }
+        #else
+        int pending_size = 0;
+        #endif
+        int res = pwrite(csfh, buf->content, cut_pos, mapping_table[iNum].real_size);
         if (res != cut_pos) return -1;
-        mapping_table[iNum].group_pos.push_back({iNum, (off_t)mapping_table[iNum].chunk_store_size, (size_t)cut_pos});
-        mapping_table[iNum].chunk_store_size += cut_pos;
+        mapping_table[iNum].group_pos.push_back({iNum, (off_t)mapping_table[iNum].real_size, (size_t)cut_pos});
+        mapping_table[iNum].real_size += cut_pos;
         std::unique_lock<std::shared_mutex> unique_fp_store_lock(fp_store_mutex);
         #ifndef NODEDUPE
         fp_store[fp] = {1, mapping_table[iNum].group_pos.back()};
         #endif
-        real_write_size += cut_pos;    // borrow fp store's lock
+        real_write_size += cut_pos + pending_size;    // borrow fp store's lock
         unique_fp_store_lock.unlock();
     }
     mapping_table[iNum].group_logical_offset.push_back(buf->start_byte);
@@ -286,9 +303,9 @@ static int dedupfs_release(const char *path, struct fuse_file_info *fi){
     }
     // pending chunk store
     char empty_buf[4096];
-    int pending_size = SECTOR_SIZE - mapping_table[iNum].chunk_store_size % SECTOR_SIZE;
-    pwrite(file_handler[fi->fh].csfh, empty_buf, pending_size, mapping_table[iNum].chunk_store_size);
-    mapping_table[iNum].chunk_store_size += pending_size;
+    int pending_size = SECTOR_SIZE - mapping_table[iNum].real_size % SECTOR_SIZE;
+    pwrite(file_handler[fi->fh].csfh, empty_buf, pending_size, mapping_table[iNum].real_size);
+    mapping_table[iNum].real_size += pending_size;
     // build real file mapping
     std::map<INUM_TYPE, int> fh_cache;  // I am not going to use fh in file handler because it might open as "write" mode
     INUM_TYPE pre_iNum = -1;
@@ -313,21 +330,21 @@ static int dedupfs_release(const char *path, struct fuse_file_info *fi){
             fh_cache[group_iNum],
             (uint64_t)src_offset,  // src offset
             length, // src length
-            mapping_table[iNum].real_size // dest offset
+            mapping_table[iNum].virtual_size // dest offset
         };
         if (length > 0){
             int res = ioctl(real_file_fh, FICLONERANGE, &range);
             if (res == -1){
                 perror("ioctl failed: ");
-                PRINT_WARNING("src_offset->" << src_offset << " length->" << length << " chunk_file_size->" << mapping_table[iNum].chunk_store_size);
+                PRINT_WARNING("src_offset->" << src_offset << " length->" << length << " chunk_file_size->" << mapping_table[iNum].real_size);
                 return -errno;
             }
         }
         if (use_same_sector)
-            mapping_table[iNum].group_virtual_offset.push_back(mapping_table[iNum].real_size + front_useless_size - SECTOR_SIZE);
+            mapping_table[iNum].group_virtual_offset.push_back(mapping_table[iNum].virtual_size + front_useless_size - SECTOR_SIZE);
         else
-            mapping_table[iNum].group_virtual_offset.push_back(mapping_table[iNum].real_size + front_useless_size);
-        mapping_table[iNum].real_size += length;
+            mapping_table[iNum].group_virtual_offset.push_back(mapping_table[iNum].virtual_size + front_useless_size);
+        mapping_table[iNum].virtual_size += length;
         mapping_table[iNum].completed_link++;
         pre_iNum = group_iNum;
         pre_last_sector = (src_offset + length - 1) / SECTOR_SIZE;

@@ -9,15 +9,25 @@
 #include "dir.h"
 
 static void dedupfs_leave(void *param){
+    uint64_t chunk_count = 0;
+    off_t virtual_write_size = 0;
+    for (const auto& file_pair: path_to_iNum){
+        INUM_TYPE iNum = file_pair.second;
+        uint64_t file_group_count = mapping_table[iNum].group_pos.size()-1;
+        chunk_count += file_group_count;
+        virtual_write_size += mapping_table[iNum].virtual_size;
+    }
     PRINT_MESSAGE("\n----------------------------------------leaving CDCFS !!!----------------------------------------");
-    PRINT_MESSAGE("total write size: " << (float)total_write_size / 1000000000 << "GB");
-    PRINT_MESSAGE("real write size: " << (float)real_write_size / 1000000000 << "GB");
+    PRINT_MESSAGE("total write size: " << (float)total_write_size / 1073741824 << "GB");
+    PRINT_MESSAGE("real write size: " << (float)real_write_size / 1073741824 << "GB");
+    PRINT_MESSAGE("virtual write size: " << (float)virtual_write_size / 1073741824 << "GB");
     PRINT_MESSAGE("total dedup rate: " << 100 - (float)real_write_size / total_write_size * 100 << "%");
     PRINT_MESSAGE("host read size: " << host_read_size);
-    PRINT_MESSAGE("host read size(GB): " << (float)host_read_size / 1000000000 << "GB");
+    PRINT_MESSAGE("host read size(GB): " << (float)host_read_size / 1073741824 << "GB");
     PRINT_MESSAGE("FUSE read size: " << fuse_read_size);
-    PRINT_MESSAGE("FUSE read size(GB): " << (float)fuse_read_size / 1000000000 << "GB");
+    PRINT_MESSAGE("FUSE read size(GB): " << (float)fuse_read_size / 1073741824 << "GB");
     PRINT_MESSAGE("read amplication: " << (float)fuse_read_size / host_read_size * 100 << "%");
+    PRINT_MESSAGE("average chunking size: " << (float)total_write_size / chunk_count);
 }
 
 static struct fuse_operations dedupfs_oper = {
