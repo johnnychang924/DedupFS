@@ -102,6 +102,10 @@ inline void init_file_handler(const char *path, FILE_HANDLER_INDEX_TYPE file_han
             .byte_cnt = 0,
             .content = new char[MAX_GROUP_SIZE],
         };
+        #ifdef CHUNK_CACHE_SIZE
+        for (int i = 0; i < CHUNK_CACHE_SIZE; i++)
+            file_handler[file_handler_index].chunkstore[i].content = new char[MAX_GROUP_SIZE];
+        #endif
     }
 }
 
@@ -179,7 +183,7 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
         off_t cur_group_offset = mapping_table[iNum].group_logical_offset[start_group_idx];
         if (cur_group_offset > offset)
             start_group_idx--;
-        else if(cur_group_offset + (off_t)mapping_table[iNum].group_pos[start_group_idx].length <= offset)
+        else if(cur_group_offset + (off_t)mapping_table[iNum].group_pos[start_group_idx]->length <= offset)
             start_group_idx++;
         else break;
         if (start_group_idx < 0 || start_group_idx >= mapping_table[iNum].group_pos.size()) return 0;   // It should not happen
@@ -188,16 +192,24 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     // find need to read range
     off_t end_off = offset + size;
     off_t front_gap = offset - mapping_table[iNum].group_logical_offset[start_group_idx];
+    if (start_group_idx > mapping_table[iNum].completed_link){
+        PRINT_WARNING("[warning] trying to read unreferenced group, group_idx: " << start_group_idx);
+        return 0;
+    }
     off_t io_off = (mapping_table[iNum].group_virtual_offset[start_group_idx] + front_gap) / SECTOR_SIZE * SECTOR_SIZE;
     GROUP_IDX_TYPE cur_group_idx = start_group_idx;
     while(cur_group_idx < mapping_table[iNum].group_logical_offset.size() && 
                 mapping_table[iNum].group_logical_offset[cur_group_idx] < end_off)
         cur_group_idx++;
     cur_group_idx -= 1;
-    off_t end_gap = mapping_table[iNum].group_logical_offset[cur_group_idx] + mapping_table[iNum].group_pos[cur_group_idx].length - end_off;
+    off_t end_gap = mapping_table[iNum].group_logical_offset[cur_group_idx] + mapping_table[iNum].group_pos[cur_group_idx]->length - end_off;
     if (end_gap < 0)
         end_gap = 0;
-    size_t io_size = mapping_table[iNum].group_virtual_offset[cur_group_idx] + (off_t)mapping_table[iNum].group_pos[cur_group_idx].length - end_gap - io_off;
+    if (cur_group_idx > mapping_table[iNum].completed_link){
+        PRINT_WARNING("[warning] trying to read unreferenced group, group_idx: " << start_group_idx);
+        return 0;
+    }
+    size_t io_size = mapping_table[iNum].group_virtual_offset[cur_group_idx] + (off_t)mapping_table[iNum].group_pos[cur_group_idx]->length - end_gap - io_off;
     io_size = (io_size + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE;  // allign with page
     // read into temp buffer
     char tmp_buf[io_size];
@@ -213,9 +225,9 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     front_gap = offset - mapping_table[iNum].group_logical_offset[cur_group_idx];
     DEBUG_MESSAGE("  filling return buffer");
     while(less > 0){
-        size_t cp_size = std::min(mapping_table[iNum].group_pos[cur_group_idx].length - front_gap, (size_t)less);
+        size_t cp_size = std::min(mapping_table[iNum].group_pos[cur_group_idx]->length - front_gap, (size_t)less);
         off_t tmp_buf_off = mapping_table[iNum].group_virtual_offset[cur_group_idx] - io_off + front_gap;
-        DEBUG_MESSAGE("    cur_group->" << cur_group_idx << " front_gap->" << front_gap << " cp_size->" << cp_size << " group_offset->" << mapping_table[iNum].group_virtual_offset[cur_group_idx] << " group_size->" << mapping_table[iNum].group_pos[cur_group_idx].length << " tmp_buffer_offset->" << tmp_buf_off);
+        DEBUG_MESSAGE("    cur_group->" << cur_group_idx << " front_gap->" << front_gap << " cp_size->" << cp_size << " group_offset->" << mapping_table[iNum].group_virtual_offset[cur_group_idx] << " group_size->" << mapping_table[iNum].group_pos[cur_group_idx]->length << " tmp_buffer_offset->" << tmp_buf_off);
         memcpy(cur_buf_ptr, tmp_buf + tmp_buf_off, cp_size);
         less -= cp_size;
         if (cur_group_idx == mapping_table[iNum].group_pos.size()-1) break;
@@ -231,6 +243,102 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     return size - std::max(less, 0);
 }
 
+inline int pending_disk(int fh, INUM_TYPE iNum, off_t target_offset){
+    DEBUG_MESSAGE("  pending disk for file handler: " << fh << " target_offset: " << target_offset);
+    int pending_size = (target_offset % SECTOR_SIZE) - (mapping_table[iNum].real_size % SECTOR_SIZE);
+    if (pending_size < 0)
+        pending_size += SECTOR_SIZE;
+    if (pending_size != 0){
+        mapping_table[iNum].real_size += pending_size;
+        ftruncate(fh, mapping_table[iNum].real_size);
+    }
+    return pending_size;
+}
+
+/*
+* write back content(in buffer or in chunk store) into disk
+*/
+inline int writeback_disk(INUM_TYPE iNum, GROUP_IDX_TYPE group_idx, int fh, char *buf, size_t size){
+    DEBUG_MESSAGE("  write back disk for iNum: " << iNum << " group_idx: " << group_idx << " size: " << size);
+    if (size == 0) return 0;
+    if (group_idx >= mapping_table[iNum].group_pos.size()){
+        PRINT_WARNING("  group_idx is out of range, group_idx: " << group_idx << " size: " << mapping_table[iNum].group_pos.size());
+        return -1;
+    }
+    int res = pwrite(fh, buf, size, mapping_table[iNum].real_size);
+    if (res != (int)size){
+        PRINT_WARNING("  write back disk failed, expected " << size << " but got " << res);
+        return res;
+    }
+    // update mapping table
+    mapping_table[iNum].group_pos[group_idx]->length = size;
+    mapping_table[iNum].group_pos[group_idx]->offset = mapping_table[iNum].real_size;
+    mapping_table[iNum].real_size += size;
+    return res;
+}
+
+/*
+* writeback one entry in chunk store into disk
+*/
+/*inline int flush_chunkstore(FILE_HANDLER_INDEX_TYPE fh_index){
+    DEBUG_MESSAGE("  flush chunk store for file handler: " << fh_index);
+    chunkstore_entry *chunkstore = &file_handler[fh_index].chunkstore;
+    INUM_TYPE iNum = file_handler[fh_index].iNum;
+    off_t disk_offset = mapping_table[iNum].real_size;
+    if (chunkstore->chunk_count == 0){
+        PRINT_WARNING("  chunk store is empty, nothing to flush");
+        return 0;
+    }
+    // find best write chunk
+    uint16_t victim_chunk_idx = -1;
+    uint16_t victim_chunk_offset = SECTOR_SIZE;
+    // try best fit first
+    for (uint32_t i = 0; i < chunkstore->chunk_count; i++){
+        uint16_t cur_offset = chunkstore->chunk_logical_offset[i] % SECTOR_SIZE;
+        if (cur_offset > disk_offset && cur_offset < victim_chunk_offset){
+            victim_chunk_idx = i;
+            victim_chunk_offset = cur_offset;
+        }
+    }
+    // if best fit not found, use smallest chunk offset
+    if (victim_chunk_idx == -1){
+        for (uint32_t i = 0; i < chunkstore->chunk_count; i++){
+            uint16_t cur_offset = chunkstore->chunk_logical_offset[i] % SECTOR_SIZE;
+            if (cur_offset < victim_chunk_offset){
+                victim_chunk_idx = i;
+                victim_chunk_offset = cur_offset;
+            }
+        }
+    }
+    // start write back chunk
+    buffer_entry *buf = &file_handler[fh_index].write_buf;
+    int csfh = file_handler[fh_index].csfh;
+    size_t res = pwrite(csfh, chunkstore->chunk[victim_chunk_idx], chunkstore->chunk_length[victim_chunk_idx], mapping_table[iNum].real_size);
+    if (res != chunkstore->chunk_length[victim_chunk_idx]){
+        PRINT_WARNING("  write chunk store failed, expected " << chunkstore->chunk_length[victim_chunk_idx] << " but got " << res);
+        return -1;
+    }
+    DEBUG_MESSAGE("  write chunk store success, size: " << chunkstore->chunk_length[victim_chunk_idx] << " offset: " << disk_offset);
+    // update mapping table
+    mapping_table[iNum].real_size += chunkstore->chunk_length[victim_chunk_idx];
+}*/
+/*
+inline int insert_chunkstore(FILE_HANDLER_INDEX_TYPE fh_index, const char *buf, size_t size, off_t offset){
+    DEBUG_MESSAGE("  insert chunk store for file handler: " << fh_index << " offset: " << offset << " size: " << size);
+    chunkstore_entry *chunkstore = &file_handler[fh_index].chunkstore;
+    if (chunkstore->chunk_count >= CHUNK_CACHE_SIZE){
+        PRINT_WARNING("  chunk store is full, flush it");
+        int res = flush_chunkstore(fh_index);
+        if (res == -1) return -1;
+    }
+    memcpy(chunkstore->chunk[chunkstore->chunk_count], buf, size);
+    chunkstore->chunk_logical_offset[chunkstore->chunk_count] = offset;
+    chunkstore->chunk_length[chunkstore->chunk_count] = size;
+    chunkstore->chunk_count++;
+    DEBUG_MESSAGE("  chunk store count(after insert): " << chunkstore->chunk_count);
+    return 0;
+}
+*/
 inline int flush_buffer(buffer_entry *buf, INUM_TYPE iNum, int csfh){       // return actual size write into disk
     DEBUG_MESSAGE("  flush buffer: " << iNum << " buf size: " << buf->byte_cnt);
     // chunking
@@ -260,23 +368,17 @@ inline int flush_buffer(buffer_entry *buf, INUM_TYPE iNum, int csfh){       // r
     }
     else{   // not found
         #ifdef PENDING
-        int pending_size = (buf->start_byte % SECTOR_SIZE) - (mapping_table[iNum].real_size % SECTOR_SIZE);
-        if (pending_size < 0)
-            pending_size += SECTOR_SIZE;
-        if (pending_size != 0){
-            mapping_table[iNum].real_size += pending_size;
-            ftruncate(csfh, mapping_table[iNum].real_size);
-        }
+        int pending_size = pending_disk(csfh, iNum, buf->start_byte);
         #else
         int pending_size = 0;
         #endif
-        int res = pwrite(csfh, buf->content, cut_pos, mapping_table[iNum].real_size);
+        chunk_addr *new_chunk_addr = new chunk_addr{ iNum, 0, 0 };
+        mapping_table[iNum].group_pos.push_back(new_chunk_addr);
+        int res = writeback_disk(iNum, mapping_table[iNum].group_pos.size()-1, csfh, buf->content, cut_pos);
         if (res != cut_pos) return -1;
-        mapping_table[iNum].group_pos.push_back({iNum, (off_t)mapping_table[iNum].real_size, (size_t)cut_pos});
-        mapping_table[iNum].real_size += cut_pos;
         std::unique_lock<std::shared_mutex> unique_fp_store_lock(fp_store_mutex);
         #ifndef NODEDUPE
-        fp_store[fp] = {1, mapping_table[iNum].group_pos.back()};
+        fp_store[fp] = {1, new_chunk_addr};
         #endif
         real_write_size += cut_pos + pending_size;    // borrow fp store's lock
         unique_fp_store_lock.unlock();
@@ -311,15 +413,15 @@ static int dedupfs_release(const char *path, struct fuse_file_info *fi){
     INUM_TYPE pre_iNum = -1;
     off_t pre_last_sector = -1;
     for (GROUP_IDX_TYPE cur_group_idx = mapping_table[iNum].completed_link; cur_group_idx < mapping_table[iNum].group_pos.size(); cur_group_idx++){
-        INUM_TYPE group_iNum = mapping_table[iNum].group_pos[cur_group_idx].iNum;
+        INUM_TYPE group_iNum = mapping_table[iNum].group_pos[cur_group_idx]->iNum;
         if (fh_cache.find(group_iNum) == fh_cache.end()){
             char full_path[1024];
             snprintf(full_path, sizeof(full_path), "%s%s%s", BACKEND, CHUNK_STORE, iNum_to_path[group_iNum].c_str());
             fh_cache[group_iNum] = open(full_path, O_RDONLY);
         }
-        size_t front_useless_size = mapping_table[iNum].group_pos[cur_group_idx].offset % SECTOR_SIZE;
-        off_t src_offset = mapping_table[iNum].group_pos[cur_group_idx].offset - front_useless_size;
-        size_t length = (mapping_table[iNum].group_pos[cur_group_idx].length + front_useless_size + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE;  // alligned with sector size
+        size_t front_useless_size = mapping_table[iNum].group_pos[cur_group_idx]->offset % SECTOR_SIZE;
+        off_t src_offset = mapping_table[iNum].group_pos[cur_group_idx]->offset - front_useless_size;
+        size_t length = (mapping_table[iNum].group_pos[cur_group_idx]->length + front_useless_size + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE;  // alligned with sector size
         bool use_same_sector = false;
         if (group_iNum == pre_iNum && src_offset / SECTOR_SIZE == pre_last_sector){
             length -= SECTOR_SIZE;
@@ -356,6 +458,10 @@ static int dedupfs_release(const char *path, struct fuse_file_info *fi){
         close(file_handler[fi->fh].csfh);
         delete[] buf->content;
         buf->content = NULL;
+        #ifdef CHUNK_CACHE_SIZE
+        for (int i = 0; i < CHUNK_CACHE_SIZE; i++)
+            delete[] file_handler[fi->fh].chunkstore[i].content;
+        #endif
     }
     close(real_file_fh);
     release_file_handler(fi->fh);

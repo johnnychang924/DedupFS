@@ -2,7 +2,7 @@ srcFolder = ./src/
 objFolder = ./build/
 srcFiles = $(wildcard $(srcFolder)*.cpp)
 objects = $(patsubst $(srcFolder)%.cpp, $(objFolder)%.o, $(srcFiles))
-cflags = -Wall -g -lssl -lcrypto -O3 `pkg-config fuse --cflags --libs`
+override cflags += -Wall -g -lssl -lcrypto -O3 `pkg-config fuse --cflags --libs`
 
 all: clean CDCFS
 
