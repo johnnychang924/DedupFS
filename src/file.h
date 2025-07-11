@@ -32,6 +32,7 @@ mapping_table_entry mapping_table[MAX_INODE_NUM];
 // file system stat record
 uint64_t total_write_size = 0;     // total size of writed file in this file system
 uint64_t real_write_size = 0;      // total size of writed file in this file system after deduplication
+uint64_t total_pending_size = 0;   // total size of pending disk
 uint64_t host_read_size = 0;
 uint64_t fuse_read_size = 0;
 // lock
@@ -266,6 +267,13 @@ inline int writeback_disk(INUM_TYPE iNum, GROUP_IDX_TYPE group_idx, int fh, char
         PRINT_WARNING("  group_idx is out of range, group_idx: " << group_idx << " size: " << mapping_table[iNum].group_pos.size());
         return -1;
     }
+    // pending disk
+    #ifdef PENDING
+    int pending_size = pending_disk(fh, iNum, mapping_table[iNum].group_logical_offset[group_idx]);
+    std::unique_lock<std::shared_mutex> unique_write_record_lock(write_record_mutex);
+    total_pending_size += pending_size;
+    unique_write_record_lock.unlock();
+    #endif
     int res = pwrite(fh, buf, size, mapping_table[iNum].real_size);
     if (res != (int)size){
         PRINT_WARNING("  write back disk failed, expected " << size << " but got " << res);
@@ -374,11 +382,6 @@ inline int flush_buffer(buffer_entry *buf, INUM_TYPE iNum, int csfh, FILE_HANDLE
         mapping_table[iNum].group_pos.push_back(fp_store_iter->second.address);
     }
     else{   // not found
-        #ifdef PENDING
-        int pending_size = pending_disk(csfh, iNum, buf->start_byte);
-        #else
-        int pending_size = 0;
-        #endif
         chunk_addr *new_chunk_addr = new chunk_addr{ iNum, 0, 0 };
         mapping_table[iNum].group_pos.push_back(new_chunk_addr);
         #ifdef CHUNK_CACHE_SIZE
@@ -391,7 +394,7 @@ inline int flush_buffer(buffer_entry *buf, INUM_TYPE iNum, int csfh, FILE_HANDLE
         #ifndef NODEDUPE
         fp_store[fp] = {1, new_chunk_addr};
         #endif
-        real_write_size += cut_pos + pending_size;    // borrow fp store's lock
+        real_write_size += cut_pos;    // borrow fp store's lock
         unique_fp_store_lock.unlock();
     }
     mapping_table[iNum].group_logical_offset.push_back(buf->start_byte);

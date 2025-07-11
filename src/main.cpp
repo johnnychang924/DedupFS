@@ -20,8 +20,9 @@ static void dedupfs_leave(void *param){
     PRINT_MESSAGE("\n----------------------------------------leaving CDCFS !!!----------------------------------------");
     PRINT_MESSAGE("total write size: " << (float)total_write_size / 1073741824 << "GB");
     PRINT_MESSAGE("real write size: " << (float)real_write_size / 1073741824 << "GB");
+    PRINT_MESSAGE("total pending size: " << (float)total_pending_size / 1073741824 << "GB");
     PRINT_MESSAGE("virtual write size: " << (float)virtual_write_size / 1073741824 << "GB");
-    PRINT_MESSAGE("total dedup rate: " << 100 - (float)real_write_size / total_write_size * 100 << "%");
+    PRINT_MESSAGE("total dedup rate: " << 100 - (float)(real_write_size + total_pending_size) / total_write_size * 100 << "%");
     PRINT_MESSAGE("host read size: " << host_read_size);
     PRINT_MESSAGE("host read size(GB): " << (float)host_read_size / 1073741824 << "GB");
     PRINT_MESSAGE("FUSE read size: " << fuse_read_size);
