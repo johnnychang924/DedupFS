@@ -9,7 +9,7 @@
 // #define PENDING
 
 // DedupFS user setting
-#define BACKEND "/home/johnnychang/Projects/DedupFS/bak"
+#define BACKEND "/home/johnnychang/Projects/CDC-dedup/helper/bak"
 #define CHUNK_STORE "/chunk_store"
 #define MAX_GROUP_SIZE 16384
 #define CHUNK_SIZE 4096
@@ -55,6 +55,7 @@ struct buffer_entry{
 };
 
 struct chunkstore_entry{
+    GROUP_IDX_TYPE group_idx;  // the group index of this chunk
     off_t logical_offset;   // logical offset of each chunk
     size_t length;          // length of this chunk
     char *content;          // the content of this chunk

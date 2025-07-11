@@ -103,6 +103,7 @@ inline void init_file_handler(const char *path, FILE_HANDLER_INDEX_TYPE file_han
             .content = new char[MAX_GROUP_SIZE],
         };
         #ifdef CHUNK_CACHE_SIZE
+        file_handler[file_handler_index].chunk_count = 0;
         for (int i = 0; i < CHUNK_CACHE_SIZE; i++)
             file_handler[file_handler_index].chunkstore[i].content = new char[MAX_GROUP_SIZE];
         #endif
@@ -271,39 +272,43 @@ inline int writeback_disk(INUM_TYPE iNum, GROUP_IDX_TYPE group_idx, int fh, char
         return res;
     }
     // update mapping table
+    DEBUG_MESSAGE("  update mapping table for iNum: " << iNum << " group_idx: " << group_idx << " (" << mapping_table[iNum].group_pos.size() << " groups)");
     mapping_table[iNum].group_pos[group_idx]->length = size;
     mapping_table[iNum].group_pos[group_idx]->offset = mapping_table[iNum].real_size;
     mapping_table[iNum].real_size += size;
     return res;
 }
 
+#ifdef CHUNK_CACHE_SIZE
 /*
 * writeback one entry in chunk store into disk
 */
-/*inline int flush_chunkstore(FILE_HANDLER_INDEX_TYPE fh_index){
+inline int flush_chunkstore(FILE_HANDLER_INDEX_TYPE fh_index){
     DEBUG_MESSAGE("  flush chunk store for file handler: " << fh_index);
-    chunkstore_entry *chunkstore = &file_handler[fh_index].chunkstore;
+    chunkstore_entry *chunkstore = file_handler[fh_index].chunkstore;
     INUM_TYPE iNum = file_handler[fh_index].iNum;
-    off_t disk_offset = mapping_table[iNum].real_size;
-    if (chunkstore->chunk_count == 0){
+    off_t disk_offset = mapping_table[iNum].real_size % SECTOR_SIZE;  // current disk offset in sector size
+    uint32_t chunk_count = file_handler[fh_index].chunk_count;
+    if (chunk_count == 0){
         PRINT_WARNING("  chunk store is empty, nothing to flush");
         return 0;
     }
     // find best write chunk
     uint16_t victim_chunk_idx = -1;
-    uint16_t victim_chunk_offset = SECTOR_SIZE;
+    uint16_t victim_chunk_offset = SECTOR_SIZE+1;
     // try best fit first
-    for (uint32_t i = 0; i < chunkstore->chunk_count; i++){
-        uint16_t cur_offset = chunkstore->chunk_logical_offset[i] % SECTOR_SIZE;
-        if (cur_offset > disk_offset && cur_offset < victim_chunk_offset){
+    for (uint32_t i = 0; i < chunk_count; i++){
+        uint16_t cur_offset = chunkstore[i].logical_offset % SECTOR_SIZE;
+        if (cur_offset >= disk_offset && cur_offset < victim_chunk_offset){
             victim_chunk_idx = i;
             victim_chunk_offset = cur_offset;
         }
     }
     // if best fit not found, use smallest chunk offset
-    if (victim_chunk_idx == -1){
-        for (uint32_t i = 0; i < chunkstore->chunk_count; i++){
-            uint16_t cur_offset = chunkstore->chunk_logical_offset[i] % SECTOR_SIZE;
+    if (victim_chunk_idx == uint16_t(-1)){
+        DEBUG_MESSAGE("  best fit chunk not found, using smallest chunk offset");
+        for (uint32_t i = 0; i < chunk_count; i++){
+            uint16_t cur_offset = chunkstore[i].logical_offset % SECTOR_SIZE;
             if (cur_offset < victim_chunk_offset){
                 victim_chunk_idx = i;
                 victim_chunk_offset = cur_offset;
@@ -311,35 +316,37 @@ inline int writeback_disk(INUM_TYPE iNum, GROUP_IDX_TYPE group_idx, int fh, char
         }
     }
     // start write back chunk
-    buffer_entry *buf = &file_handler[fh_index].write_buf;
-    int csfh = file_handler[fh_index].csfh;
-    size_t res = pwrite(csfh, chunkstore->chunk[victim_chunk_idx], chunkstore->chunk_length[victim_chunk_idx], mapping_table[iNum].real_size);
-    if (res != chunkstore->chunk_length[victim_chunk_idx]){
-        PRINT_WARNING("  write chunk store failed, expected " << chunkstore->chunk_length[victim_chunk_idx] << " but got " << res);
-        return -1;
+    DEBUG_MESSAGE("  victim chunk index: " << victim_chunk_idx << " offset: " << chunkstore[victim_chunk_idx].logical_offset << " size: " << chunkstore[victim_chunk_idx].length);
+    int res = writeback_disk(iNum, chunkstore[victim_chunk_idx].group_idx, file_handler[fh_index].csfh, chunkstore[victim_chunk_idx].content, chunkstore[victim_chunk_idx].length);
+    // remove this chunk from chunk store
+    char *victim_chunk_content = chunkstore[victim_chunk_idx].content;
+    for (uint32_t i = victim_chunk_idx + 1; i < chunk_count; i++){
+        chunkstore[i-1] = chunkstore[i];
     }
-    DEBUG_MESSAGE("  write chunk store success, size: " << chunkstore->chunk_length[victim_chunk_idx] << " offset: " << disk_offset);
-    // update mapping table
-    mapping_table[iNum].real_size += chunkstore->chunk_length[victim_chunk_idx];
-}*/
-/*
-inline int insert_chunkstore(FILE_HANDLER_INDEX_TYPE fh_index, const char *buf, size_t size, off_t offset){
-    DEBUG_MESSAGE("  insert chunk store for file handler: " << fh_index << " offset: " << offset << " size: " << size);
-    chunkstore_entry *chunkstore = &file_handler[fh_index].chunkstore;
-    if (chunkstore->chunk_count >= CHUNK_CACHE_SIZE){
-        PRINT_WARNING("  chunk store is full, flush it");
+    chunkstore[chunk_count-1].content = victim_chunk_content;
+    file_handler[fh_index].chunk_count--;
+    return res;
+}
+
+inline int insert_chunkstore(FILE_HANDLER_INDEX_TYPE fh_index, const char *buf, size_t size, off_t offset, GROUP_IDX_TYPE group_idx){
+    DEBUG_MESSAGE("  insert chunk store for file handler: " << fh_index << " offset: " << offset << " size: " << size << " group_idx: " << group_idx);
+    chunkstore_entry *chunkstore = file_handler[fh_index].chunkstore;
+    if (file_handler[fh_index].chunk_count >= CHUNK_CACHE_SIZE){
+        DEBUG_MESSAGE("  chunk store is full");
         int res = flush_chunkstore(fh_index);
         if (res == -1) return -1;
     }
-    memcpy(chunkstore->chunk[chunkstore->chunk_count], buf, size);
-    chunkstore->chunk_logical_offset[chunkstore->chunk_count] = offset;
-    chunkstore->chunk_length[chunkstore->chunk_count] = size;
-    chunkstore->chunk_count++;
-    DEBUG_MESSAGE("  chunk store count(after insert): " << chunkstore->chunk_count);
-    return 0;
+    int chunk_index = file_handler[fh_index].chunk_count++;
+    memcpy(chunkstore[chunk_index].content, buf, size);
+    chunkstore[chunk_index].group_idx = group_idx;
+    chunkstore[chunk_index].logical_offset = offset;
+    chunkstore[chunk_index].length = size;
+    DEBUG_MESSAGE("  chunk store count(after insert): " << chunk_index + 1);
+    return size;
 }
-*/
-inline int flush_buffer(buffer_entry *buf, INUM_TYPE iNum, int csfh){       // return actual size write into disk
+#endif
+
+inline int flush_buffer(buffer_entry *buf, INUM_TYPE iNum, int csfh, FILE_HANDLER_INDEX_TYPE fh_index){       // return actual size write into disk
     DEBUG_MESSAGE("  flush buffer: " << iNum << " buf size: " << buf->byte_cnt);
     // chunking
     std::unique_lock<std::shared_mutex> unique_chunker_lock(chunker_mutex);
@@ -374,7 +381,11 @@ inline int flush_buffer(buffer_entry *buf, INUM_TYPE iNum, int csfh){       // r
         #endif
         chunk_addr *new_chunk_addr = new chunk_addr{ iNum, 0, 0 };
         mapping_table[iNum].group_pos.push_back(new_chunk_addr);
+        #ifdef CHUNK_CACHE_SIZE
+        int res = insert_chunkstore(fh_index, buf->content, cut_pos, buf->start_byte, mapping_table[iNum].group_pos.size() - 1);
+        #else
         int res = writeback_disk(iNum, mapping_table[iNum].group_pos.size()-1, csfh, buf->content, cut_pos);
+        #endif
         if (res != cut_pos) return -1;
         std::unique_lock<std::shared_mutex> unique_fp_store_lock(fp_store_mutex);
         #ifndef NODEDUPE
@@ -400,9 +411,17 @@ static int dedupfs_release(const char *path, struct fuse_file_info *fi){
     int real_file_fh = file_handler[fi->fh].fh;
     buffer_entry *buf = &file_handler[fi->fh].write_buf;
     while(buf->byte_cnt > 0){
-        int res = flush_buffer(buf, iNum, file_handler[fi->fh].csfh);
+        int res = flush_buffer(buf, iNum, file_handler[fi->fh].csfh, fi->fh);
         if (res == -1) return -errno;
     }
+    // write back chunk store
+    #ifdef CHUNK_CACHE_SIZE
+    while(file_handler[fi->fh].chunk_count){
+        int res = flush_chunkstore(fi->fh);
+        if (res == -1) return -errno;
+    }
+    file_handler[fi->fh].chunk_count = 0;
+    #endif
     // pending chunk store
     char empty_buf[4096];
     int pending_size = SECTOR_SIZE - mapping_table[iNum].real_size % SECTOR_SIZE;
@@ -488,7 +507,7 @@ static int dedupfs_write(const char *path, const char *buf, size_t size, off_t o
         less -= fill_size;
         buf_ptr += fill_size;
         if (write_buf->byte_cnt == MAX_GROUP_SIZE){
-            int res = flush_buffer(write_buf, iNum, file_handler[fi->fh].csfh);
+            int res = flush_buffer(write_buf, iNum, file_handler[fi->fh].csfh, fi->fh);
             if (res == -1) return -errno;
         }
     }
