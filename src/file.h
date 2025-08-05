@@ -45,6 +45,11 @@ std::shared_mutex read_record_mutex;    // the lock for record host/fuse/ssd rea
 // fastCDC chunker
 fcdc_ctx cdc, *ctx;
 
+#ifdef RECORD_LATENCY
+// record each page's read bandwidth
+each_page_read_bandwidth each_file_read_bandwidth[MAX_INODE_NUM];
+#endif
+
 inline INUM_TYPE get_inum(PATH_TYPE path_str){
     std::shared_lock<std::shared_mutex> shared_create_file_lock(create_file_mutex);     // make sure nobody is creating new file at the same time
     auto it = path_to_iNum.find(path_str);
@@ -177,6 +182,9 @@ static int dedupfs_open(const char *path, struct fuse_file_info *fi) {
 
 static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi){
     DEBUG_MESSAGE("[read]" << path << " offset: " << offset << " size: " << size);
+    #ifdef RECORD_LATENCY
+    auto start_time = std::chrono::high_resolution_clock::now();
+    #endif
     INUM_TYPE iNum = file_handler[fi->fh].iNum;
     if ((size_t)offset > mapping_table[iNum].logical_size || size == 0) return 0;
     // find first block group index
@@ -237,6 +245,14 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
         cur_group_idx++;
         front_gap = 0;
     }
+    #ifdef RECORD_LATENCY
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::micro> latency_us = end_time - start_time;
+    for (uint32_t i = offset / SECTOR_SIZE; i < std::min((std::size_t)(offset + size + SECTOR_SIZE - 1) / SECTOR_SIZE, each_file_read_bandwidth[iNum].lat.size()); i++){
+        each_file_read_bandwidth[iNum].lat[i] += latency_us.count();
+        each_file_read_bandwidth[iNum].count[i] += 1;
+    }
+    #endif
     // record fs read information
     std::unique_lock<std::shared_mutex> unique_read_record_lock(read_record_mutex);
     host_read_size += std::abs((off_t)std::min(offset + size, mapping_table[iNum].logical_size) - offset);
@@ -398,8 +414,13 @@ inline int flush_buffer(buffer_entry *buf, INUM_TYPE iNum, int csfh, FILE_HANDLE
         unique_fp_store_lock.unlock();
     }
     mapping_table[iNum].group_logical_offset.push_back(buf->start_byte);
-    for(GROUP_IDX_TYPE i = mapping_table[iNum].group_idx.size(); i <= (buf->start_byte + cut_pos) / CHUNK_SIZE; i++)
+    for(GROUP_IDX_TYPE i = mapping_table[iNum].group_idx.size(); i <= (buf->start_byte + cut_pos) / CHUNK_SIZE; i++){
         mapping_table[iNum].group_idx.push_back(mapping_table[iNum].group_pos.size() - 1);
+        #ifdef RECORD_LATENCY
+        each_file_read_bandwidth[iNum].lat.push_back(0);
+        each_file_read_bandwidth[iNum].count.push_back(0);
+        #endif
+    }
     if (buf->byte_cnt - cut_pos > 0)
         memcpy(buf->content, buf->content+cut_pos, buf->byte_cnt - cut_pos);
     buf->start_byte += cut_pos;

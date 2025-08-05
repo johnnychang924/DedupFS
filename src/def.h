@@ -8,6 +8,9 @@
 // pending
 // #define PENDING
 
+// record page read latehcy
+// #define RECORD_LATENCY
+
 // DedupFS user setting
 #define BACKEND "/home/johnnychang/Projects/CDC-dedup/helper/bak"
 #define CHUNK_STORE "/chunk_store"
@@ -72,6 +75,13 @@ struct file_handler_data{
     chunkstore_entry chunkstore[CHUNK_CACHE_SIZE]; // cache for chunk data
     #endif
 };
+
+#ifdef RECORD_LATENCY
+struct each_page_read_bandwidth{
+    std::vector<double> lat;
+    std::vector<uint32_t> count;
+};
+#endif
 
 // message output macro
 #ifdef DEBUG
