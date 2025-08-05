@@ -32,12 +32,31 @@ static void dedupfs_leave(void *param){
     #ifdef RECORD_LATENCY
     // output bandwidth of each page to file
     std::ofstream lat_output(RECORD_LATENCY_PATH);
+    std::ofstream frag_output(RECORD_FRAG_PATH);
     for (const auto& file_pair: path_to_iNum){
         lat_output << "file_name: " << file_pair.first << std::endl;
         lat_output << "page_count: " << each_file_read_bandwidth[file_pair.second].lat.size() << std::endl;
         // output latency and count
         for (uint32_t i = 0; i < each_file_read_bandwidth[file_pair.second].lat.size(); i++){
             lat_output << each_file_read_bandwidth[file_pair.second].lat[i] << " " << each_file_read_bandwidth[file_pair.second].count[i] << std::endl;
+        }
+        // output fragmentation
+        frag_output << "file_name: " << file_pair.first << std::endl;
+        frag_output << "page_count: " << mapping_table[file_pair.second].group_idx.size() << std::endl;
+        for (uint32_t page_num = 0; page_num < mapping_table[file_pair.second].group_idx.size(); page_num++){
+            GROUP_IDX_TYPE start_group_idx = mapping_table[file_pair.second].group_idx[page_num];
+            GROUP_IDX_TYPE cur_group_idx = start_group_idx;
+            size_t start_gap = page_num * SECTOR_SIZE - mapping_table[file_pair.second].group_logical_offset[cur_group_idx];
+            int less = SECTOR_SIZE + start_gap;
+            if (start_gap < 0 || start_gap > SECTOR_SIZE)
+                PRINT_WARNING("Critical Error: wrong group index");
+            while(less > 0 && cur_group_idx < mapping_table[file_pair.second].group_pos.size()){
+                less -= mapping_table[file_pair.second].group_pos[cur_group_idx++]->length;
+            }
+            off_t group_end_virtual_offset = mapping_table[file_pair.second].group_virtual_offset[cur_group_idx - 1] + less;
+            off_t group_start_virtual_offset = mapping_table[file_pair.second].group_virtual_offset[start_group_idx] + start_gap;
+            int read_size = (((group_end_virtual_offset + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE) - group_start_virtual_offset / SECTOR_SIZE * SECTOR_SIZE);
+            frag_output << read_size << std::endl;
         }
     }
     #endif

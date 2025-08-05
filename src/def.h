@@ -11,9 +11,10 @@
 // record page read latehcy
 // #define RECORD_LATENCY
 #define RECORD_LATENCY_PATH "/home/johnnychang/result/fuse.lat"
+#define RECORD_FRAG_PATH "/home/johnnychang/result/fuse.frag"
 
 // DedupFS user setting
-#define BACKEND "/home/johnnychang/Projects/CDC-dedup/helper/bak"
+#define BACKEND "/home/johnnychang/Projects/DedupFS/bak"
 #define CHUNK_STORE "/chunk_store"
 #define MAX_GROUP_SIZE 16384
 #define CHUNK_SIZE 4096
