@@ -53,7 +53,7 @@ static void dedupfs_leave(void *param){
             while(less > 0 && cur_group_idx < mapping_table[file_pair.second].group_pos.size()){
                 less -= mapping_table[file_pair.second].group_pos[cur_group_idx++]->length;
             }
-            off_t group_end_virtual_offset = mapping_table[file_pair.second].group_virtual_offset[cur_group_idx - 1] + less;
+            off_t group_end_virtual_offset = mapping_table[file_pair.second].group_virtual_offset[cur_group_idx - 1] + mapping_table[file_pair.second].group_pos[cur_group_idx - 1]->length + less;
             off_t group_start_virtual_offset = mapping_table[file_pair.second].group_virtual_offset[start_group_idx] + start_gap;
             int read_size = (((group_end_virtual_offset + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE) - group_start_virtual_offset / SECTOR_SIZE * SECTOR_SIZE);
             frag_output << read_size << std::endl;
