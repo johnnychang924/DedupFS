@@ -29,6 +29,18 @@ static void dedupfs_leave(void *param){
     PRINT_MESSAGE("FUSE read size(GB): " << (float)fuse_read_size / 1073741824 << "GB");
     PRINT_MESSAGE("read amplication: " << (float)fuse_read_size / host_read_size * 100 << "%");
     PRINT_MESSAGE("average chunking size: " << (float)total_write_size / chunk_count);
+    #ifdef RECORD_LATENCY
+    // output bandwidth of each page to file
+    std::ofstream lat_output(RECORD_LATENCY_PATH);
+    for (const auto& file_pair: path_to_iNum){
+        lat_output << "file_name: " << file_pair.first << std::endl;
+        lat_output << "page_count: " << each_file_read_bandwidth[file_pair.second].lat.size() << std::endl;
+        // output latency and count
+        for (uint32_t i = 0; i < each_file_read_bandwidth[file_pair.second].lat.size(); i++){
+            lat_output << each_file_read_bandwidth[file_pair.second].lat[i] << " " << each_file_read_bandwidth[file_pair.second].count[i] << std::endl;
+        }
+    }
+    #endif
 }
 
 static struct fuse_operations dedupfs_oper = {

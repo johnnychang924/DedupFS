@@ -10,6 +10,7 @@
 
 // record page read latehcy
 // #define RECORD_LATENCY
+#define RECORD_LATENCY_PATH "/home/johnnychang/result/fuse.lat"
 
 // DedupFS user setting
 #define BACKEND "/home/johnnychang/Projects/CDC-dedup/helper/bak"
