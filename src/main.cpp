@@ -48,8 +48,8 @@ static void dedupfs_leave(void *param){
             GROUP_IDX_TYPE cur_group_idx = start_group_idx;
             size_t start_gap = page_num * SECTOR_SIZE - mapping_table[file_pair.second].group_logical_offset[cur_group_idx];
             int less = SECTOR_SIZE + start_gap;
-            if (start_gap < 0 || start_gap > SECTOR_SIZE)
-                PRINT_WARNING("Critical Error: wrong group index");
+            if (start_gap < 0 || start_gap > mapping_table[file_pair.second].group_pos[cur_group_idx]->length)
+                PRINT_WARNING("Critical Error: Wrong group index, start_gap: " << start_gap);
             while(less > 0 && cur_group_idx < mapping_table[file_pair.second].group_pos.size()){
                 less -= mapping_table[file_pair.second].group_pos[cur_group_idx++]->length;
             }

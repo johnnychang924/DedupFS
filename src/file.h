@@ -414,7 +414,7 @@ inline int flush_buffer(buffer_entry *buf, INUM_TYPE iNum, int csfh, FILE_HANDLE
         unique_fp_store_lock.unlock();
     }
     mapping_table[iNum].group_logical_offset.push_back(buf->start_byte);
-    for(GROUP_IDX_TYPE i = mapping_table[iNum].group_idx.size(); i <= (buf->start_byte + cut_pos) / CHUNK_SIZE; i++){
+    for(GROUP_IDX_TYPE i = mapping_table[iNum].group_idx.size(); i <= (buf->start_byte + cut_pos - 1) / CHUNK_SIZE; i++){
         mapping_table[iNum].group_idx.push_back(mapping_table[iNum].group_pos.size() - 1);
         #ifdef RECORD_LATENCY
         each_file_read_bandwidth[iNum].lat.push_back(0);
