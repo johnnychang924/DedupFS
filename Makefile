@@ -15,6 +15,9 @@ CAFTL: all
 NoDedupe: cflags += -DNODEDUPE
 NoDedupe: all
 
+Pending: cflags += -DPENDING
+Pending: all
+
 $(objFolder)%.o: $(srcFolder)%.cpp
 	@mkdir -p $(objFolder)
 	$(CXX) $(cflags) -c -o $@ $<

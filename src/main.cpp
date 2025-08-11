@@ -114,6 +114,12 @@ int main(int argc, char *argv[]) {
     }
     // init CDCFS data structure
     PRINT_MESSAGE("----------------------------------------entering CDCFS !!----------------------------------------");
+    #ifdef PENDING
+        PRINT_MESSAGE("enable pending!!");
+    #endif
+    #ifdef RECORD_LATENCY
+        PRINT_MESSAGE("enable record latency!!");
+    #endif
     for (INUM_TYPE iNum = 0; iNum < MAX_INODE_NUM - 1; ++iNum)
         free_iNum.insert(iNum);
     for(FILE_HANDLER_INDEX_TYPE file_handler = 0; file_handler < MAX_FILE_HANDLER - 1; ++file_handler)
@@ -123,7 +129,7 @@ int main(int argc, char *argv[]) {
     mkdir(BACKEND CHUNK_STORE, 0766);
     umask(old_mask); // Restore the original umask after operation
     // init fastcdc engine
-    cdc = fastcdc_init(0, CHUNK_SIZE, MAX_GROUP_SIZE);
+    cdc = fastcdc_init(512, CHUNK_SIZE, MAX_GROUP_SIZE);
     ctx = &cdc;
     // start FUSE daemon
     return fuse_main(argc, argv, &dedupfs_oper, NULL);
