@@ -13,6 +13,9 @@
 #define RECORD_LATENCY_PATH "/home/johnnychang/result/fuse.lat"
 #define RECORD_FRAG_PATH "/home/johnnychang/result/fuse.frag"
 
+// #define RECORD_READ_REQ
+#define RECORD_READ_REQ_PATH "/home/johnnychang/result/fuse.rdreq"
+
 // DedupFS user setting
 #define BACKEND "/home/johnnychang/Projects/CDC-dedup/helper/bak"
 #define CHUNK_STORE "/chunk_store"
@@ -82,6 +85,19 @@ struct file_handler_data{
 struct each_page_read_bandwidth{
     std::vector<double> lat;
     std::vector<uint32_t> count;
+};
+#endif
+
+#ifdef RECORD_READ_REQ
+#define MAX_READ_REQ_RECORD 26214400
+struct read_req{
+    struct timespec start_time;
+    struct timespec end_time;
+    INUM_TYPE iNum;
+    off_t offset;
+    size_t size;
+    size_t ssd_size;
+    size_t real_io_size;
 };
 #endif
 

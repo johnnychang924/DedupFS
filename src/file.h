@@ -17,6 +17,7 @@
 #include "fastcdc.h"
 #include <sys/ioctl.h>
 #include <linux/fs.h>
+#include <time.h>
 
 // iNumber management
 std::set<INUM_TYPE> free_iNum;
@@ -48,6 +49,11 @@ fcdc_ctx cdc, *ctx;
 #ifdef RECORD_LATENCY
 // record each page's read bandwidth
 each_page_read_bandwidth each_file_read_bandwidth[MAX_INODE_NUM];
+#endif
+
+#ifdef RECORD_READ_REQ
+struct read_req read_req_list[MAX_READ_REQ_RECORD];
+uint64_t read_req_count = 0;
 #endif
 
 inline INUM_TYPE get_inum(PATH_TYPE path_str){
@@ -185,7 +191,19 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     #ifdef RECORD_LATENCY
     auto start_time = std::chrono::high_resolution_clock::now();
     #endif
+    
     INUM_TYPE iNum = file_handler[fi->fh].iNum;
+
+    #ifdef RECORD_READ_REQ
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    read_req_list[read_req_count].start_time = ts;
+    read_req_list[read_req_count].iNum = iNum;
+    read_req_list[read_req_count].offset = offset;
+    read_req_list[read_req_count].size = size;
+    DEBUG_MESSAGE("start time: sec->" << ts.tv_sec << " nsec->" << ts.tv_nsec);
+    #endif
+
     if ((size_t)offset > mapping_table[iNum].logical_size || size == 0) return 0;
     // find first block group index
     GROUP_IDX_TYPE start_group_idx = mapping_table[iNum].group_idx[offset / CHUNK_SIZE];
@@ -207,6 +225,8 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
         return 0;
     }
     off_t io_off = (mapping_table[iNum].group_virtual_offset[start_group_idx] + front_gap) / SECTOR_SIZE * SECTOR_SIZE;
+    // just for validate
+    size_t real_io_size = mapping_table[iNum].group_virtual_offset[start_group_idx] + front_gap;
     GROUP_IDX_TYPE cur_group_idx = start_group_idx;
     while(cur_group_idx < mapping_table[iNum].group_logical_offset.size() && 
                 mapping_table[iNum].group_logical_offset[cur_group_idx] < end_off)
@@ -220,6 +240,8 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
         return 0;
     }
     size_t io_size = mapping_table[iNum].group_virtual_offset[cur_group_idx] + (off_t)mapping_table[iNum].group_pos[cur_group_idx]->length - end_gap - io_off;
+    // just for validate
+    real_io_size = mapping_table[iNum].group_virtual_offset[cur_group_idx] + (off_t)mapping_table[iNum].group_pos[cur_group_idx]->length - end_gap - real_io_size;
     io_size = (io_size + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE;  // allign with page
     // read into temp buffer
     char tmp_buf[io_size];
@@ -235,7 +257,7 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     front_gap = offset - mapping_table[iNum].group_logical_offset[cur_group_idx];
     DEBUG_MESSAGE("  filling return buffer");
     while(less > 0){
-        size_t cp_size = std::min(mapping_table[iNum].group_pos[cur_group_idx]->length - front_gap, (size_t)less);
+        size_t cp_size = std::min(mapping_table[iNum].group_pos[cur_group_idx]->length - (size_t)front_gap, (size_t)less);
         off_t tmp_buf_off = mapping_table[iNum].group_virtual_offset[cur_group_idx] - io_off + front_gap;
         DEBUG_MESSAGE("    cur_group->" << cur_group_idx << " front_gap->" << front_gap << " cp_size->" << cp_size << " group_offset->" << mapping_table[iNum].group_virtual_offset[cur_group_idx] << " group_size->" << mapping_table[iNum].group_pos[cur_group_idx]->length << " tmp_buffer_offset->" << tmp_buf_off);
         memcpy(cur_buf_ptr, tmp_buf + tmp_buf_off, cp_size);
@@ -258,6 +280,14 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     host_read_size += std::abs((off_t)std::min(offset + size, mapping_table[iNum].logical_size) - offset);
     fuse_read_size += io_size;
     unique_read_record_lock.unlock();
+    #ifdef RECORD_READ_REQ
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    read_req_list[read_req_count].ssd_size = io_size;
+    read_req_list[read_req_count].real_io_size = real_io_size;
+    read_req_list[read_req_count++].end_time = ts;
+    if(read_req_count > MAX_READ_REQ_RECORD) read_req_count = MAX_READ_REQ_RECORD - 1;
+    DEBUG_MESSAGE("end time: sec->" << ts.tv_sec << " nsec->" << ts.tv_nsec);
+    #endif
     return size - std::max(less, 0);
 }
 

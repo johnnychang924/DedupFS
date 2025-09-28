@@ -60,6 +60,20 @@ static void dedupfs_leave(void *param){
         }
     }
     #endif
+    #ifdef RECORD_READ_REQ
+    std::ofstream read_req_output(RECORD_READ_REQ_PATH);
+    for(uint64_t i = 0; i < read_req_count; i++){
+        read_req_output << read_req_list[i].start_time.tv_sec << " " << read_req_list[i].start_time.tv_nsec << " ";
+        read_req_output << read_req_list[i].end_time.tv_sec << " "  << read_req_list[i].end_time.tv_nsec << " ";
+        read_req_output << read_req_list[i].iNum << " ";
+        read_req_output << read_req_list[i].offset << " ";
+        read_req_output << read_req_list[i].size << " ";
+        read_req_output << read_req_list[i].ssd_size << " ";
+        read_req_output << read_req_list[i].real_io_size << std::endl;
+    }
+    unsigned long rd_record_used_perc = read_req_count * 10000UL / MAX_READ_REQ_RECORD;
+    PRINT_MESSAGE("Use up to " << rd_record_used_perc / 100 << "." << rd_record_used_perc % 100 << "% read record space");
+    #endif
 }
 
 static struct fuse_operations dedupfs_oper = {
