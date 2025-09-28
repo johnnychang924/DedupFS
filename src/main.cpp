@@ -134,6 +134,9 @@ int main(int argc, char *argv[]) {
     #ifdef RECORD_LATENCY
         PRINT_MESSAGE("enable record latency!!");
     #endif
+    #ifdef RECORD_READ_REQ
+        PRINT_MESSAGE("enable record read request!!");
+    #endif
     for (INUM_TYPE iNum = 0; iNum < MAX_INODE_NUM - 1; ++iNum)
         free_iNum.insert(iNum);
     for(FILE_HANDLER_INDEX_TYPE file_handler = 0; file_handler < MAX_FILE_HANDLER - 1; ++file_handler)
