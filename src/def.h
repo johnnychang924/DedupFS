@@ -94,6 +94,7 @@ struct read_req{
     struct timespec start_time;
     struct timespec end_time;
     INUM_TYPE iNum;
+    bool ref_other;
     off_t offset;
     size_t size;
     size_t ssd_size;

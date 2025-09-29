@@ -66,6 +66,7 @@ static void dedupfs_leave(void *param){
         read_req_output << read_req_list[i].start_time.tv_sec << " " << read_req_list[i].start_time.tv_nsec << " ";
         read_req_output << read_req_list[i].end_time.tv_sec << " "  << read_req_list[i].end_time.tv_nsec << " ";
         read_req_output << read_req_list[i].iNum << " ";
+        read_req_output << (read_req_list[i].ref_other ? "yes" : "no") << " ";
         read_req_output << read_req_list[i].offset << " ";
         read_req_output << read_req_list[i].size << " ";
         read_req_output << read_req_list[i].ssd_size << " ";

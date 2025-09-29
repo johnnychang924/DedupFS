@@ -239,6 +239,12 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
         PRINT_WARNING("[warning] trying to read unreferenced group, group_idx: " << start_group_idx);
         return 0;
     }
+    #ifdef RECORD_READ_REQ
+    read_req_list[read_req_count].ref_other = false;
+    for (GROUP_IDX_TYPE i = start_group_idx; i <= cur_group_idx; i++){
+        read_req_list[read_req_count].ref_other |= mapping_table[iNum].group_pos[i]->iNum != iNum;
+    }
+    #endif
     size_t io_size = mapping_table[iNum].group_virtual_offset[cur_group_idx] + (off_t)mapping_table[iNum].group_pos[cur_group_idx]->length - end_gap - io_off;
     // just for validate
     real_io_size = mapping_table[iNum].group_virtual_offset[cur_group_idx] + (off_t)mapping_table[iNum].group_pos[cur_group_idx]->length - end_gap - real_io_size;
