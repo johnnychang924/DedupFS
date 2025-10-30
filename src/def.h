@@ -8,6 +8,9 @@
 // pending
 // #define PENDING
 
+// force allign deduplication
+// #define allign_dedup
+
 // record page read latehcy
 // #define RECORD_LATENCY
 #define RECORD_LATENCY_PATH "/home/johnnychang/result/fuse.lat"
@@ -44,7 +47,7 @@ struct chunk_addr{
 };
 struct hash_store_entry{
     uint8_t ref_times;      // how many times this group is referenced
-    chunk_addr *address;
+    std::vector<chunk_addr*> address_list;
 };
 struct mapping_table_entry{
     std::vector<GROUP_IDX_TYPE> group_idx;              // the group index of each "BLOCK"

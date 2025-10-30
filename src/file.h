@@ -326,6 +326,7 @@ inline int writeback_disk(INUM_TYPE iNum, GROUP_IDX_TYPE group_idx, int fh, char
     total_pending_size += pending_size;
     unique_write_record_lock.unlock();
     #endif
+    DEBUG_MESSAGE("Pending success");
     int res = pwrite(fh, buf, size, mapping_table[iNum].real_size);
     if (res != (int)size){
         PRINT_WARNING("  write back disk failed, expected " << size << " but got " << res);
@@ -428,10 +429,28 @@ inline int flush_buffer(buffer_entry *buf, INUM_TYPE iNum, int csfh, FILE_HANDLE
     fp_store_iter = fp_store.find(fp);
     shared_fp_store_lock.unlock();
     #endif
-    if (fp_store_iter != fp_store.end()){   // found
+    // scan duplicate target
+    int found_target_index = -1;
+    #ifdef allign_dedup
+    if (fp_store_iter != fp_store.end()){
+        for (int index = 0; index < (int)fp_store[fp].address_list.size(); index++){
+            if (fp_store[fp].address_list[index]->offset % CHUNK_SIZE == buf->start_byte % CHUNK_SIZE)
+                found_target_index = index;
+        }
+    }
+    else{
+        fp_store[fp] = {0, std::vector<chunk_addr*>()};
+    }
+    #else
+    if (fp_store_iter != fp_store.end()){
+        found_target_index = 0;
+    }
+    #endif
+    mapping_table[iNum].group_logical_offset.push_back(buf->start_byte);
+    if (found_target_index != -1){   // found
         DEBUG_MESSAGE("    found duplicate group!!");
         fp_store_iter->second.ref_times += 1;
-        mapping_table[iNum].group_pos.push_back(fp_store_iter->second.address);
+        mapping_table[iNum].group_pos.push_back(fp_store_iter->second.address_list[found_target_index]);
     }
     else{   // not found
         chunk_addr *new_chunk_addr = new chunk_addr{ iNum, 0, 0 };
@@ -444,12 +463,13 @@ inline int flush_buffer(buffer_entry *buf, INUM_TYPE iNum, int csfh, FILE_HANDLE
         if (res != cut_pos) return -1;
         std::unique_lock<std::shared_mutex> unique_fp_store_lock(fp_store_mutex);
         #ifndef NODEDUPE
-        fp_store[fp] = {1, new_chunk_addr};
+        // fp_store[fp] = {1, new_chunk_addr};
+        fp_store[fp].ref_times += 1;
+        fp_store[fp].address_list.push_back(new_chunk_addr);
         #endif
         real_write_size += cut_pos;    // borrow fp store's lock
         unique_fp_store_lock.unlock();
     }
-    mapping_table[iNum].group_logical_offset.push_back(buf->start_byte);
     for(GROUP_IDX_TYPE i = mapping_table[iNum].group_idx.size(); i <= (buf->start_byte + cut_pos - 1) / CHUNK_SIZE; i++){
         mapping_table[iNum].group_idx.push_back(mapping_table[iNum].group_pos.size() - 1);
         #ifdef RECORD_LATENCY
