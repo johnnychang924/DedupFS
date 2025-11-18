@@ -41,11 +41,16 @@ static int dedupfs_symlink(const char *oldpath, const char *newpath) {
     return symlink(full_old, full_new);
 }
 
-/*static int cdcfs_truncate(const char *path, off_t size) {
+static int dedupfs_truncate(const char *path, off_t size) {
+    // this function will only use on /command file
     int res;
     char full_path[1024];
     snprintf(full_path, sizeof(full_path), "%s%s", BACKEND, path);
     DEBUG_MESSAGE("[truncate]" << path << " size: " << size);
+    if (strncmp(path, COMMAND_PATH, sizeof(COMMAND_PATH)) != 0){
+        PRINT_WARNING("This system is not support truncate.");
+        return -1;
+    }
 
     res = truncate(full_path, size);
     if (res == -1) {
@@ -53,7 +58,7 @@ static int dedupfs_symlink(const char *oldpath, const char *newpath) {
     }
     return 0;
 }
-
+/*
 static int cdcfs_ftruncate(const char *path, off_t size, fuse_file_info *fi) {
     int res;
     return 0;

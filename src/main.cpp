@@ -85,7 +85,7 @@ static struct fuse_operations dedupfs_oper = {
     .rmdir          = dedupfs_rmdir,
     .symlink        = dedupfs_symlink,
     .link           = dedupfs_link,
-    //.truncate       = dedupfs_truncate,
+    .truncate       = dedupfs_truncate,
     .utime          = dedupfs_utime,
     .open           = dedupfs_open,
     .read           = dedupfs_read,
@@ -132,6 +132,12 @@ int main(int argc, char *argv[]) {
     #ifdef PENDING
         PRINT_MESSAGE("enable pending!!");
     #endif
+    #ifdef REWRITE
+        PRINT_MESSAGE("enable rewrite!!");
+        #ifdef REWRITE_DEDUP
+            PRINT_MESSAGE("enable rewrite deduplication!!");
+        #endif
+    #endif
     #ifdef RECORD_LATENCY
         PRINT_MESSAGE("enable record latency!!");
     #endif
@@ -145,6 +151,10 @@ int main(int argc, char *argv[]) {
     // build chunk store
     mode_t old_mask = umask(0);  // Temporarily set umask to 0
     mkdir(BACKEND CHUNK_STORE, 0766);
+    // build system command file
+    fuse_file_info fi;
+    dedupfs_create(COMMAND_PATH, 0666, &fi);
+    dedupfs_release(COMMAND_PATH, &fi);
     umask(old_mask); // Restore the original umask after operation
     // init fastcdc engine
     cdc = fastcdc_init(512, CHUNK_SIZE, MAX_GROUP_SIZE);

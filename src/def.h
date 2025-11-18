@@ -8,6 +8,14 @@
 // pending
 // #define PENDING
 
+// rewrite
+// #define REWRITE
+// #define REWRITE_DEDUP
+#define REWRITE_FILE_PATH "/rewrite"
+
+// file system command file
+#define COMMAND_PATH "/command"
+
 // force allign deduplication
 // #define allign_dedup
 
@@ -27,6 +35,8 @@
 #define SSD_ONESHOT 4096
 #define SECTOR_SIZE 4096        // Btrfs minimum write size(normally 4096)
 // #define CHUNK_CACHE_SIZE 10      // how many chunk to cache in file handler(comment this line to disable chunk cache)
+#define LRU_LEN 262144     // 1GB pages
+#define ONESHOT_REWRITE_COUNT LRU_LEN * 0.2
 
 // don't change it!
 #define MAX_INODE_NUM 1048576
