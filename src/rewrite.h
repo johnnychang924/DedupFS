@@ -99,6 +99,9 @@ void rewrite_handler(std::map<INUM_TYPE, std::set<off_t>> rewrite_map){
                     }
                     else src_off = fp_store_iter->second;
                     #else
+                    char buf[SECTOR_SIZE];
+                    size_t io_size, real_io_size;   // just for internal_read
+                    internal_read(iNum, old_file_fh, buf, SECTOR_SIZE, cur_process_offset, io_size, real_io_size);
                     pwrite(rewrite_fh, buf, SECTOR_SIZE, rewrite_file_size);
                     src_off = rewrite_file_size;
                     rewrite_file_size += SECTOR_SIZE;
