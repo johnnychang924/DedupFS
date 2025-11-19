@@ -29,6 +29,10 @@ static void dedupfs_leave(void *param){
     PRINT_MESSAGE("FUSE read size(GB): " << (float)fuse_read_size / 1073741824 << "GB");
     PRINT_MESSAGE("read amplication: " << (float)fuse_read_size / host_read_size * 100 << "%");
     PRINT_MESSAGE("average chunking size: " << (float)total_write_size / chunk_count);
+    PRINT_MESSAGE("Total rewrite size(GB): " << (float)total_rewrite_size / 1073741824 << "GB");
+    PRINT_MESSAGE("Total rewrite size: " << total_rewrite_size);
+    PRINT_MESSAGE("Real rewrite size(GB): " << (float)real_rewrite_size / 1073741824 << "GB");
+    PRINT_MESSAGE("Real rewrite size: " << real_rewrite_size);
     #ifdef RECORD_LATENCY
     // output bandwidth of each page to file
     std::ofstream lat_output(RECORD_LATENCY_PATH);

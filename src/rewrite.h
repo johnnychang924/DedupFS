@@ -22,6 +22,9 @@ std::unordered_map<FP_TYPE, off_t> rewrite_fp_store;
 off_t rewrite_file_size = 0;
 LRU_list lru = LRU_list(LRU_LEN);
 
+uint64_t total_rewrite_size = 0;    // Total rewrite size(include duplicate page)
+uint64_t real_rewrite_size = 0;     // real rewrite size to the disk(exclude deuplicate page)
+
 extern mapping_table_entry mapping_table[MAX_INODE_NUM];
 extern inline PATH_TYPE get_path(INUM_TYPE iNum);
 extern inline int build_virtual_file(INUM_TYPE iNum, int fh);
@@ -80,6 +83,7 @@ void rewrite_handler(std::map<INUM_TYPE, std::set<off_t>> rewrite_map){
                 else if(need_rewrite && cur_process_offset == *offset_it){
                     // rewrite page
                     off_t src_off;
+                    total_rewrite_size += SECTOR_SIZE;
                     #ifdef REWRITE_DEDUP
                     // write out need to rewrite page
                     char buf[SECTOR_SIZE];
@@ -92,6 +96,7 @@ void rewrite_handler(std::map<INUM_TYPE, std::set<off_t>> rewrite_map){
                     // check FP exist in rewrite file
                     auto fp_store_iter = rewrite_fp_store.find(fp);
                     if (fp_store_iter == rewrite_fp_store.end()){
+                        real_rewrite_size += SECTOR_SIZE;
                         pwrite(rewrite_fh, buf, SECTOR_SIZE, rewrite_file_size);
                         rewrite_fp_store[fp] = rewrite_file_size;
                         src_off = rewrite_file_size;
@@ -102,6 +107,7 @@ void rewrite_handler(std::map<INUM_TYPE, std::set<off_t>> rewrite_map){
                     char buf[SECTOR_SIZE];
                     size_t io_size, real_io_size;   // just for internal_read
                     internal_read(iNum, old_file_fh, buf, SECTOR_SIZE, cur_process_offset, io_size, real_io_size);
+                    real_rewrite_size += SECTOR_SIZE;
                     pwrite(rewrite_fh, buf, SECTOR_SIZE, rewrite_file_size);
                     src_off = rewrite_file_size;
                     rewrite_file_size += SECTOR_SIZE;
