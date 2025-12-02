@@ -280,8 +280,9 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     size_t io_size = 0;
     int ret = internal_read(iNum, file_handler[fi->fh].fh, buf, size, offset, io_size, real_io_size);
     #ifdef REWRITE
-    for (off_t LPA = offset / SECTOR_SIZE; LPA < (offset + (off_t)size + SECTOR_SIZE - 1) / SECTOR_SIZE; LPA++)
-        lru.read(iNum, LPA);
+    if (io_size != size)
+        for (off_t LPA = offset / SECTOR_SIZE; LPA < (offset + (off_t)size + SECTOR_SIZE - 1) / SECTOR_SIZE; LPA++)
+            lfu.touch((uint64_t)iNum << 32 | LPA);
     #endif
     if (ret == 0)
         return ret;     // something went wrong, return the process to prevent more system damage

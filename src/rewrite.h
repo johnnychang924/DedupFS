@@ -9,7 +9,7 @@
 #include <linux/fs.h>        /* Definition of FICLONE* constants */
 #include <sys/ioctl.h>
 
-#include "lru_list.h"
+#include "lfu_list.h"
 #include "def.h"
 
 struct rewrite_req_struct{
@@ -20,7 +20,7 @@ struct rewrite_req_struct{
 
 std::unordered_map<FP_TYPE, off_t> rewrite_fp_store;
 off_t rewrite_file_size = 0;
-LRU_list lru = LRU_list(LRU_LEN);
+LFUList lfu;
 
 uint64_t total_rewrite_size = 0;    // Total rewrite size(include duplicate page)
 uint64_t real_rewrite_size = 0;     // real rewrite size to the disk(exclude deuplicate page)
@@ -60,23 +60,39 @@ void rewrite_handler(std::map<INUM_TYPE, std::set<off_t>> rewrite_map){
         int old_file_fh = open((BACKEND + old_file_name).c_str(), O_RDONLY);
         mapping_table_entry new_mapping_table_entry;
         new_mapping_table_entry.logical_size = mapping_table[iNum].logical_size;
-        new_mapping_table_entry.virtual_size = mapping_table[iNum].virtual_size;
         new_mapping_table_entry.real_size = mapping_table[iNum].real_size;
         GROUP_IDX_TYPE cur_group_idx;
         auto offset_it = pair.second.begin();
+        off_t prev_cur_process_offset = -1;  // for debug use
+        off_t cur_process_offset = 0;
         // loop file's each group
         for (cur_group_idx = 0; cur_group_idx < mapping_table[iNum].group_pos.size(); cur_group_idx++){
             // check if this group needs to be rewritten
             off_t start_group_offset = mapping_table[iNum].group_logical_offset[cur_group_idx];
             off_t end_group_offset = start_group_offset + mapping_table[iNum].group_pos[cur_group_idx]->length;
-            off_t cur_process_offset = start_group_offset;
-            bool at_first = true;
             INUM_TYPE group_ori_iNum = mapping_table[iNum].group_pos[cur_group_idx]->iNum;
             while (cur_process_offset < end_group_offset){
-                bool need_rewrite = offset_it != pair.second.end() && *offset_it <= end_group_offset;
+                //PRINT_MESSAGE("start_group_offset: " << start_group_offset << " cur_process_offset: " << cur_process_offset << " end_group_offset: " << end_group_offset);
+                bool need_rewrite = offset_it != pair.second.end() && *offset_it < end_group_offset;
+                need_rewrite = need_rewrite && *offset_it + SECTOR_SIZE <= (off_t)mapping_table[iNum].logical_size;
+                bool at_first = cur_process_offset == start_group_offset;
+                if (cur_process_offset <= prev_cur_process_offset) [[unlikely]] {
+                    PRINT_WARNING("rewrite error: cur_process_offset not moving forward");
+                    PRINT_WARNING("group_idx: " << cur_group_idx);
+                    PRINT_WARNING("start_group_offset: " << start_group_offset);
+                    PRINT_WARNING("prev_cur_process_offset: " << prev_cur_process_offset);
+                    PRINT_WARNING("cur_process_offset: " << cur_process_offset);
+                    PRINT_WARNING("end_group_offset: " << end_group_offset);
+                    PRINT_WARNING("next offset to rewrite: " << (offset_it != pair.second.end() ? *offset_it : -1));
+                    PRINT_WARNING("logical_size: " << mapping_table[iNum].logical_size);
+                    PRINT_WARNING("need_rewrite: " << need_rewrite);
+                    PRINT_WARNING("at_first: " << at_first);
+                    return;
+                }
+                prev_cur_process_offset = cur_process_offset;
                 if (at_first && !need_rewrite){
                     // fast forward
-                    new_mapping_table_entry.group_logical_offset.push_back(mapping_table[iNum].group_logical_offset[cur_group_idx]);
+                    new_mapping_table_entry.group_logical_offset.push_back(start_group_offset);
                     new_mapping_table_entry.group_pos.push_back(mapping_table[iNum].group_pos[cur_group_idx]);
                     cur_process_offset = end_group_offset;
                 }
@@ -123,8 +139,8 @@ void rewrite_handler(std::map<INUM_TYPE, std::set<off_t>> rewrite_map){
                     uint16_t front_gap = cur_process_offset - start_group_offset;
                     off_t new_group_pos_off = mapping_table[iNum].group_pos[cur_group_idx]->offset + front_gap;
                     size_t new_group_len;
-                    if (offset_it != pair.second.end())
-                        new_group_len = std::min(end_group_offset, *offset_it) - cur_process_offset;
+                    if (need_rewrite)
+                        new_group_len = *offset_it - cur_process_offset;
                     else
                         new_group_len = end_group_offset - cur_process_offset;
                     chunk_addr *new_chunk_addr = new chunk_addr{ group_ori_iNum, new_group_pos_off, new_group_len };
@@ -132,11 +148,10 @@ void rewrite_handler(std::map<INUM_TYPE, std::set<off_t>> rewrite_map){
                     new_mapping_table_entry.group_pos.push_back(new_chunk_addr);
                     cur_process_offset += new_group_len;
                 }
-                uint64_t end_logical_page = (mapping_table[iNum].group_logical_offset[cur_group_idx] + mapping_table[iNum].group_pos[cur_group_idx]->length) / CHUNK_SIZE;
+                uint64_t end_logical_page = cur_process_offset / CHUNK_SIZE;
                 for(GROUP_IDX_TYPE i = new_mapping_table_entry.group_idx.size(); i <= end_logical_page; i++){
-                    mapping_table[iNum].group_idx.push_back(new_mapping_table_entry.group_pos.size() - 1);
+                    new_mapping_table_entry.group_idx.push_back(new_mapping_table_entry.group_pos.size() - 1);
                 }
-                at_first = false;
             }
         }
         // update mapping table
@@ -152,18 +167,23 @@ void rewrite_handler(std::map<INUM_TYPE, std::set<off_t>> rewrite_map){
 
 // rewrite wrapper
 void rewrite(){
+    #ifdef REWRITE
     DEBUG_MESSAGE("[rewrite]");
     DEBUG_MESSAGE("Finding rewrite target");
     // find need to rewrite chunk
     std::map<INUM_TYPE, std::set<off_t>> rewrite_map;
     uint64_t have_rewrite_page = 0;
-    while (have_rewrite_page < ONESHOT_REWRITE_COUNT && !lru.empty()){
-        Node *head_node = lru.pop_head();
-        DEBUG_MESSAGE("  iNum: " << head_node->iNum << " LPA: " << head_node->page_off);
-        rewrite_map[head_node->iNum].insert(head_node->page_off);
-        delete head_node;
+    std::vector<uint64_t> rewrite_target = lfu.topK(ONESHOT_REWRITE_COUNT);
+    for (auto lpa : rewrite_target) {
+        INUM_TYPE iNum = lpa >> 32;
+        off_t page_off = (lpa & 0xFFFFFFFF) * SECTOR_SIZE;
+        DEBUG_MESSAGE("  iNum: " << iNum << " LPA: " << page_off);
+        rewrite_map[iNum].insert(page_off);
         have_rewrite_page += 1;
     }
     // call rewrite_handler
     rewrite_handler(rewrite_map);
+    #else
+    PRINT_WARNING("rewrite is not enabled !!");
+    #endif
 }
