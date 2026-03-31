@@ -51,6 +51,10 @@
 #define FILE_HANDLER_INDEX_TYPE uint32_t
 #define GROUP_IDX_TYPE uint32_t
 
+// freq tracker
+#define DECAY_FACTOR 0.9
+#define TIME_INTERVAL 1000
+
 // struct define
 struct chunk_addr{
     INUM_TYPE iNum;
