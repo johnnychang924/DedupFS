@@ -114,7 +114,10 @@ void rewrite_handler(std::map<INUM_TYPE, std::set<off_t>> rewrite_map){
                     // write out need to rewrite page
                     char buf[SECTOR_SIZE];
                     size_t io_size, real_io_size;   // just for internal_read
+                    {
+                    std::shared_lock<std::shared_mutex> read_lock(mapping_table_mutex[iNum]);
                     internal_read(iNum, old_file_fh, buf, SECTOR_SIZE, cur_process_offset, io_size, real_io_size);
+                    }
                     // calculate new FP
                     char tmp_fp[SHA_DIGEST_LENGTH];
                     SHA1((const unsigned char *)buf, SECTOR_SIZE, (unsigned char *)tmp_fp);
@@ -132,7 +135,10 @@ void rewrite_handler(std::map<INUM_TYPE, std::set<off_t>> rewrite_map){
                     #else
                     char buf[SECTOR_SIZE];
                     size_t io_size, real_io_size;   // just for internal_read
+                    {
+                    std::shared_lock<std::shared_mutex> read_lock(mapping_table_mutex[iNum]);
                     internal_read(iNum, old_file_fh, buf, SECTOR_SIZE, cur_process_offset, io_size, real_io_size);
+                    }
                     real_rewrite_size += SECTOR_SIZE;
                     pwrite(rewrite_fh, buf, SECTOR_SIZE, rewrite_file_size);
                     src_off = rewrite_file_size;
@@ -328,7 +334,6 @@ void inline_rewrite_handler(INUM_TYPE iNum, std::set<std::pair<off_t, char*>, Re
     {
         std::unique_lock<std::shared_mutex> write_lock(mapping_table_mutex[iNum]);
         mapping_table[iNum] = new_mapping_table_entry;
-        mapping_table[iNum].version++;
         remove(full_file_path.c_str());
         rename(full_shadow_file_name.c_str(), full_file_path.c_str());
     }

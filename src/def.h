@@ -80,7 +80,6 @@ struct mapping_table_entry{
     size_t logical_size = 0;                            // the file size host will see(before dedup)
     size_t virtual_size = 0;                            // how many chunk have been reflink into virtual file(in bytes)
     size_t real_size = 0;                               // how many size has been used in real file
-    uint32_t version = 0;                               // bumped on inline rewrite to invalidate stale fh
 };
 struct buffer_entry{
     off_t start_byte;       // which bytes to start
@@ -100,7 +99,7 @@ struct file_handler_data{
     int fh;                     // the file descriptor of the file
     int csfh;                   // the file descriptor of chunk store
     char mode;                  // the mode of open('r' | 'w')
-    uint32_t version = 0;       // mapping table version at open time
+    std::shared_lock<std::shared_mutex> fh_lock; // shared for reads, exclusive when inline rewrite swaps fd
     buffer_entry write_buf;     // the buffer use for write operation.
     #ifdef CHUNK_CACHE_SIZE
     uint8_t chunk_count = 0; // how many chunks in chunk store
