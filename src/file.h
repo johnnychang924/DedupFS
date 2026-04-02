@@ -19,6 +19,7 @@
 #include <sys/ioctl.h>
 #include <linux/fs.h>
 #include <time.h>
+#include "freq_tracker.h"
 
 // iNumber management
 std::set<INUM_TYPE> free_iNum;
@@ -44,8 +45,13 @@ std::shared_mutex file_handler_mutex;   // the lock for allocate file handler an
 std::shared_mutex chunker_mutex;        // the lock for access chunker
 std::shared_mutex write_record_mutex;  // the lock for recording file system status
 std::shared_mutex read_record_mutex;    // the lock for record host/fuse/ssd read size
+std::shared_mutex mapping_table_mutex[MAX_INODE_NUM];   // per-file lock: shared for reads, exclusive for inline rewrite
 // fastCDC chunker
 fcdc_ctx cdc, *ctx;
+
+#ifdef INLINE_REWRITE
+FreqTracker freq_tracker;
+#endif
 
 #ifdef RECORD_LATENCY
 // record each page's read bandwidth
@@ -191,6 +197,7 @@ static int dedupfs_open(const char *path, struct fuse_file_info *fi) {
 }
 // for dedupfs internal read
 inline int internal_read(INUM_TYPE iNum, int fh, char *buf, size_t size, off_t offset, size_t &io_size, size_t &real_io_size){
+    std::shared_lock<std::shared_mutex> read_lock(mapping_table_mutex[iNum]);
     // find first block group index
     GROUP_IDX_TYPE start_group_idx = mapping_table[iNum].group_idx[offset / CHUNK_SIZE];
     while (true) {
@@ -279,20 +286,59 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     size_t real_io_size = 0;
     size_t io_size = 0;
     int ret = internal_read(iNum, file_handler[fi->fh].fh, buf, size, offset, io_size, real_io_size);
+    if (ret == 0)
+        return ret;     // something went wrong, return the process to prevent more system damage
+    #ifdef INLINE_REWRITE
+    if (io_size != size) {
+        float min_score = std::numeric_limits<float>::max();
+        for (off_t LPA = offset / SECTOR_SIZE; LPA < (offset + (off_t)size + SECTOR_SIZE - 1) / SECTOR_SIZE; LPA++)
+            min_score = std::min(min_score, freq_tracker.read((uint64_t)iNum << 32 | LPA));
+        if (min_score > INLINE_REWRITE_THRESHOLD) {
+            // phase 1: build rewrite requests under mapping table shared lock only
+            std::vector<rewrite_req_struct> pending;
+            {
+                std::shared_lock<std::shared_mutex> read_lock(mapping_table_mutex[iNum]);
+                for (off_t LPA = offset / SECTOR_SIZE; LPA < (offset + (off_t)size + SECTOR_SIZE - 1) / SECTOR_SIZE; LPA++) {
+                    off_t page_offset = LPA * SECTOR_SIZE;
+                    off_t buf_off = page_offset - offset;
+                    if (buf_off < 0 || buf_off + SECTOR_SIZE > (off_t)size) continue;
+                    // skip pages that are already sector-aligned in the virtual file
+                    // (reading them causes no amplification, so rewriting them is unnecessary)
+                    GROUP_IDX_TYPE gidx = mapping_table[iNum].group_idx[LPA];
+                    off_t front_gap = page_offset - mapping_table[iNum].group_logical_offset[gidx];
+                    off_t virt_start = mapping_table[iNum].group_virtual_offset[gidx] + front_gap;
+                    if ((size_t)front_gap + SECTOR_SIZE <= mapping_table[iNum].group_pos[gidx]->length
+                        && virt_start % SECTOR_SIZE == 0) continue;
+                    rewrite_req_struct req;
+                    req.iNum = iNum;
+                    req.logical_offset = page_offset;
+                    memcpy(req.buffer, buf + buf_off, SECTOR_SIZE);
+                    pending.push_back(std::move(req));
+                }
+            }
+            // phase 2: push to queue under exclusive lock (brief critical section)
+            if (!pending.empty()) {
+                {
+                    std::unique_lock<std::shared_mutex> queue_lock(inline_rewrite_mutex);
+                    for (auto& req : pending)
+                        inline_rewrite_queue.push(std::move(req));
+                }
+                inline_rewrite_cv.notify_one();
+            }
+        }
+    }
+    #endif
     #ifdef REWRITE
     if (io_size != size)
         for (off_t LPA = offset / SECTOR_SIZE; LPA < (offset + (off_t)size + SECTOR_SIZE - 1) / SECTOR_SIZE; LPA++)
             lfu.touch((uint64_t)iNum << 32 | LPA);
     #endif
-    if (ret == 0)
-        return ret;     // something went wrong, return the process to prevent more system damage
     #ifdef RECORD_READ_REQ
     read_req_list[read_req_count].ref_other = false;
     for (GROUP_IDX_TYPE i = start_group_idx; i <= cur_group_idx; i++){
         read_req_list[read_req_count].ref_other |= mapping_table[iNum].group_pos[i]->iNum != iNum;
     }
     #endif
-    
     #ifdef RECORD_LATENCY
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::micro> latency_us = end_time - start_time;
@@ -504,12 +550,12 @@ inline int flush_buffer(buffer_entry *buf, INUM_TYPE iNum, int csfh, FILE_HANDLE
     return 0;
 }
 
-inline int build_virtual_file(INUM_TYPE iNum, int fh){
+inline int build_virtual_file(mapping_table_entry& entry, int fh){
     std::map<INUM_TYPE, int> fh_cache;  // I am not going to use fh in file handler because it might open as "write" mode
     INUM_TYPE pre_iNum = -1;
     off_t pre_last_sector = -1;
-    for (GROUP_IDX_TYPE cur_group_idx = mapping_table[iNum].completed_link; cur_group_idx < mapping_table[iNum].group_pos.size(); cur_group_idx++){
-        INUM_TYPE group_iNum = mapping_table[iNum].group_pos[cur_group_idx]->iNum;
+    for (GROUP_IDX_TYPE cur_group_idx = entry.completed_link; cur_group_idx < entry.group_pos.size(); cur_group_idx++){
+        INUM_TYPE group_iNum = entry.group_pos[cur_group_idx]->iNum;
         if (fh_cache.find(group_iNum) == fh_cache.end()){
             char full_path[1024];
             snprintf(full_path, sizeof(full_path), "%s%s%s", BACKEND, CHUNK_STORE, iNum_to_path[group_iNum].c_str());
@@ -520,9 +566,9 @@ inline int build_virtual_file(INUM_TYPE iNum, int fh){
                 return -1;
             }
         }
-        size_t front_useless_size = mapping_table[iNum].group_pos[cur_group_idx]->offset % SECTOR_SIZE;
-        off_t src_offset = mapping_table[iNum].group_pos[cur_group_idx]->offset - front_useless_size;
-        size_t length = (mapping_table[iNum].group_pos[cur_group_idx]->length + front_useless_size + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE;  // alligned with sector size
+        size_t front_useless_size = entry.group_pos[cur_group_idx]->offset % SECTOR_SIZE;
+        off_t src_offset = entry.group_pos[cur_group_idx]->offset - front_useless_size;
+        size_t length = (entry.group_pos[cur_group_idx]->length + front_useless_size + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE;  // alligned with sector size
         bool use_same_sector = false;
         if (group_iNum == pre_iNum && src_offset / SECTOR_SIZE == pre_last_sector){
             length -= SECTOR_SIZE;
@@ -533,22 +579,22 @@ inline int build_virtual_file(INUM_TYPE iNum, int fh){
             fh_cache[group_iNum],
             (uint64_t)src_offset,  // src offset
             length, // src length
-            mapping_table[iNum].virtual_size // dest offset
+            entry.virtual_size // dest offset
         };
         if (length > 0){
             int res = ioctl(fh, FICLONERANGE, &range);
             if (res == -1){
                 perror("ioctl failed: ");
-                PRINT_WARNING("src_offset->" << src_offset << " length->" << length << " chunk_file_size->" << mapping_table[iNum].real_size);
+                PRINT_WARNING("src_offset->" << src_offset << " length->" << length << " chunk_file_size->" << entry.real_size);
                 return -errno;
             }
         }
         if (use_same_sector)
-            mapping_table[iNum].group_virtual_offset.push_back(mapping_table[iNum].virtual_size + front_useless_size - SECTOR_SIZE);
+            entry.group_virtual_offset.push_back(entry.virtual_size + front_useless_size - SECTOR_SIZE);
         else
-            mapping_table[iNum].group_virtual_offset.push_back(mapping_table[iNum].virtual_size + front_useless_size);
-        mapping_table[iNum].virtual_size += length;
-        mapping_table[iNum].completed_link++;
+            entry.group_virtual_offset.push_back(entry.virtual_size + front_useless_size);
+        entry.virtual_size += length;
+        entry.completed_link++;
         pre_iNum = group_iNum;
         pre_last_sector = (src_offset + length - 1) / SECTOR_SIZE;
     }
@@ -556,6 +602,10 @@ inline int build_virtual_file(INUM_TYPE iNum, int fh){
     for (auto it = fh_cache.begin(); it != fh_cache.end(); it++)
         close(it->second);
     return 0;
+}
+
+inline int build_virtual_file(INUM_TYPE iNum, int fh){
+    return build_virtual_file(mapping_table[iNum], fh);
 }
 
 static int dedupfs_release(const char *path, struct fuse_file_info *fi){

@@ -2,11 +2,14 @@
 
 #include <filesystem>
 #include <fstream>
+#include <thread>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include "file.h"
 #include "utils.h"
 #include "dir.h"
+
+std::thread rewrite_thread;
 
 static void dedupfs_leave(void *param){
     uint64_t chunk_count = 0;
@@ -17,6 +20,11 @@ static void dedupfs_leave(void *param){
         chunk_count += file_group_count;
         virtual_write_size += mapping_table[iNum].virtual_size;
     }
+    #ifdef INLINE_REWRITE
+    running = false;
+    inline_rewrite_cv.notify_one();
+    rewrite_thread.join();
+    #endif
     PRINT_MESSAGE("\n----------------------------------------leaving CDCFS !!!----------------------------------------");
     PRINT_MESSAGE("total write size: " << (float)total_write_size / 1073741824 << "GB");
     PRINT_MESSAGE("real write size: " << (float)real_write_size / 1073741824 << "GB");
@@ -163,6 +171,10 @@ int main(int argc, char *argv[]) {
     // init fastcdc engine
     cdc = fastcdc_init(512, CHUNK_SIZE, MAX_GROUP_SIZE);
     ctx = &cdc;
+    // start rewrite worker thread
+    #ifdef INLINE_REWRITE
+    rewrite_thread = std::thread(inline_rewrite_worker);
+    #endif
     // start FUSE daemon
     return fuse_main(argc, argv, &dedupfs_oper, NULL);
 }

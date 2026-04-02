@@ -10,6 +10,7 @@
 
 // rewrite
 // #define REWRITE
+// #define INLINE_REWRITE
 // #define REWRITE_DEDUP
 #define REWRITE_FILE_PATH "/rewrite"
 
@@ -54,6 +55,11 @@
 // freq tracker
 #define DECAY_FACTOR 0.9
 #define TIME_INTERVAL 1000
+
+// inline rewrite threshold
+#define PAGE_READ_LATENCY 50000
+#define PAGE_WRITE_LATENCY 561000
+#define INLINE_REWRITE_THRESHOLD (PAGE_WRITE_LATENCY / PAGE_READ_LATENCY)
 
 // struct define
 struct chunk_addr{
