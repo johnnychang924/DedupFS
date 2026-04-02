@@ -18,6 +18,14 @@ struct rewrite_req_struct{
     char buffer[SECTOR_SIZE];
 };
 
+// Compare only by logical_offset, ignoring buffer pointer,
+// so duplicate offsets are deduplicated in a set.
+struct RewriteChunkCmp {
+    bool operator()(const std::pair<off_t, char*>& a, const std::pair<off_t, char*>& b) const {
+        return a.first < b.first;
+    }
+};
+
 std::unordered_map<FP_TYPE, off_t> rewrite_fp_store;
 off_t rewrite_file_size = 0;
 LFUList lfu;
@@ -197,7 +205,7 @@ void rewrite(){
 * @iNum: the file iNum of target file
 * @rewrite_chunk: the offset and content of the chunk to be rewrited
 */
-void inline_rewrite_handler(INUM_TYPE iNum, std::set<std::pair<off_t, char*>> rewrite_chunk){
+void inline_rewrite_handler(INUM_TYPE iNum, std::set<std::pair<off_t, char*>, RewriteChunkCmp> rewrite_chunk){
     int rewrite_fh = open(BACKEND CHUNK_STORE REWRITE_FILE_PATH, O_RDWR | O_CREAT, 0666);
     if (rewrite_fh == -1) [[unlikely]] {
         PRINT_WARNING("Can not open rewrite file");
@@ -349,11 +357,9 @@ void inline_rewrite_worker(){
             }
         }
         // group requests by iNum, using pointers into the stable batch vector
-        std::map<INUM_TYPE, std::set<std::pair<off_t, char*>>> rewrite_map;
-        off_t last_offset = -1;
+        // Deduplicate by logical_offset only, ignoring buffer pointer.
+        std::map<INUM_TYPE, std::set<std::pair<off_t, char*>, RewriteChunkCmp>> rewrite_map;
         for (auto& req : batch){
-            if (last_offset == req.logical_offset) continue;
-            last_offset = req.logical_offset;
             rewrite_map[req.iNum].insert({req.logical_offset, req.buffer});
         }
         for (auto& [iNum, chunks] : rewrite_map){
