@@ -26,11 +26,14 @@ public:
     // thread safety
     mutable std::shared_mutex mtx;
 
+    bool has_rewrite = false;
+
 public:
     // Initialize freq_buckets
     LFUList(){ freq_buckets.resize(2); }
     // Increase frequency count for an LPA
     void touch(LPA lpa) {
+        if (has_rewrite) return;
         std::unique_lock lock(mtx);
 
         auto it = table.find(lpa);

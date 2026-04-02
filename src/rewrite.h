@@ -185,6 +185,8 @@ void rewrite(){
     }
     // call rewrite_handler
     rewrite_handler(rewrite_map);
+    lfu.clear();
+    lfu.has_rewrite = true;
     #else
     PRINT_WARNING("rewrite is not enabled !!");
     #endif
