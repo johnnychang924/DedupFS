@@ -217,7 +217,7 @@ void inline_rewrite_handler(INUM_TYPE iNum, std::set<std::pair<off_t, char*>, Re
         PRINT_WARNING("can not find file path, iNum: " << iNum);
         return;
     }
-    // 1. create a shadow file to rebuild in the background
+    // create a shadow file to rebuild in the background
     std::string shadow_file_name = file_name + "temp";
     std::string full_shadow_file_name = BACKEND + shadow_file_name;
     std::string full_file_path = BACKEND + file_name;
@@ -328,6 +328,7 @@ void inline_rewrite_handler(INUM_TYPE iNum, std::set<std::pair<off_t, char*>, Re
     {
         std::unique_lock<std::shared_mutex> write_lock(mapping_table_mutex[iNum]);
         mapping_table[iNum] = new_mapping_table_entry;
+        mapping_table[iNum].version++;
         remove(full_file_path.c_str());
         rename(full_shadow_file_name.c_str(), full_file_path.c_str());
     }

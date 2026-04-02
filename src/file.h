@@ -114,6 +114,7 @@ inline void init_file_handler(const char *path, FILE_HANDLER_INDEX_TYPE file_han
         .fh = real_file_handler,
         .csfh = chunk_store_file_handler,
         .mode = mode,
+        .version = mapping_table[iNum].version,
     };
     if (mode == 'w'){
         file_handler[file_handler_index].write_buf = {
@@ -282,7 +283,19 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     #endif
 
     if ((size_t)offset > mapping_table[iNum].logical_size || size == 0) return 0;
-    
+
+    // check if inline rewrite has replaced the virtual file since this fh was opened
+    if (file_handler[fi->fh].version != mapping_table[iNum].version){
+        char full_path[1024];
+        snprintf(full_path, sizeof(full_path), "%s%s", BACKEND, path);
+        int new_fh = open(full_path, O_RDONLY);
+        if (new_fh != -1){
+            close(file_handler[fi->fh].fh);
+            file_handler[fi->fh].fh = new_fh;
+            file_handler[fi->fh].version = mapping_table[iNum].version;
+        }
+    }
+
     size_t real_io_size = 0;
     size_t io_size = 0;
     int ret = internal_read(iNum, file_handler[fi->fh].fh, buf, size, offset, io_size, real_io_size);
