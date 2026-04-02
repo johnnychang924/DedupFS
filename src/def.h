@@ -54,7 +54,7 @@
 
 // freq tracker
 #define DECAY_FACTOR 0.9
-#define TIME_INTERVAL 1000
+#define TIME_INTERVAL 60000000
 
 // inline rewrite threshold
 #define PAGE_READ_LATENCY 50000

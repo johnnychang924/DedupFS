@@ -350,7 +350,10 @@ void inline_rewrite_worker(){
         }
         // group requests by iNum, using pointers into the stable batch vector
         std::map<INUM_TYPE, std::set<std::pair<off_t, char*>>> rewrite_map;
+        off_t last_offset = -1;
         for (auto& req : batch){
+            if (last_offset == req.logical_offset) continue;
+            last_offset = req.logical_offset;
             rewrite_map[req.iNum].insert({req.logical_offset, req.buffer});
         }
         for (auto& [iNum, chunks] : rewrite_map){
