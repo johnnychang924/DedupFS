@@ -197,8 +197,19 @@ static int dedupfs_open(const char *path, struct fuse_file_info *fi) {
     return 0;
 }
 // for dedupfs internal read
-inline int internal_read(INUM_TYPE iNum, int fh, char *buf, size_t size, off_t offset, size_t &io_size, size_t &real_io_size){
+inline int internal_read(INUM_TYPE iNum, int &fh, uint32_t &version, const char *path, char *buf, size_t size, off_t offset, size_t &io_size, size_t &real_io_size){
     std::shared_lock<std::shared_mutex> read_lock(mapping_table_mutex[iNum]);
+    // check if inline rewrite has replaced the virtual file since this fh was opened
+    if (version != mapping_table[iNum].version){
+        char full_path[1024];
+        snprintf(full_path, sizeof(full_path), "%s%s", BACKEND, path);
+        int new_fh = open(full_path, O_RDONLY);
+        if (new_fh != -1){
+            close(fh);
+            fh = new_fh;
+            version = mapping_table[iNum].version;
+        }
+    }
     // find first block group index
     GROUP_IDX_TYPE start_group_idx = mapping_table[iNum].group_idx[offset / CHUNK_SIZE];
     while (true) {
@@ -284,21 +295,9 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
 
     if ((size_t)offset > mapping_table[iNum].logical_size || size == 0) return 0;
 
-    // check if inline rewrite has replaced the virtual file since this fh was opened
-    if (file_handler[fi->fh].version != mapping_table[iNum].version){
-        char full_path[1024];
-        snprintf(full_path, sizeof(full_path), "%s%s", BACKEND, path);
-        int new_fh = open(full_path, O_RDONLY);
-        if (new_fh != -1){
-            close(file_handler[fi->fh].fh);
-            file_handler[fi->fh].fh = new_fh;
-            file_handler[fi->fh].version = mapping_table[iNum].version;
-        }
-    }
-
     size_t real_io_size = 0;
     size_t io_size = 0;
-    int ret = internal_read(iNum, file_handler[fi->fh].fh, buf, size, offset, io_size, real_io_size);
+    int ret = internal_read(iNum, file_handler[fi->fh].fh, file_handler[fi->fh].version, path, buf, size, offset, io_size, real_io_size);
     if (ret == 0)
         return ret;     // something went wrong, return the process to prevent more system damage
     #ifdef INLINE_REWRITE

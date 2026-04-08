@@ -39,7 +39,7 @@ extern inline PATH_TYPE get_path(INUM_TYPE iNum);
 extern inline int build_virtual_file(INUM_TYPE iNum, int fh);
 extern inline int build_virtual_file(mapping_table_entry& entry, int fh);
 extern inline INUM_TYPE get_inum(PATH_TYPE path_str);
-extern inline int internal_read(INUM_TYPE iNum, int fh, char *buf, size_t size, off_t offset, size_t &io_size, size_t &real_io_size);
+extern inline int internal_read(INUM_TYPE iNum, int &fh, uint32_t &version, const char *path, char *buf, size_t size, off_t offset, size_t &io_size, size_t &real_io_size);
 
 void rewrite_handler(std::map<INUM_TYPE, std::set<off_t>> rewrite_map){
     // rewrite file handler
@@ -114,7 +114,8 @@ void rewrite_handler(std::map<INUM_TYPE, std::set<off_t>> rewrite_map){
                     // write out need to rewrite page
                     char buf[SECTOR_SIZE];
                     size_t io_size, real_io_size;   // just for internal_read
-                    internal_read(iNum, old_file_fh, buf, SECTOR_SIZE, cur_process_offset, io_size, real_io_size);
+                    uint32_t tmp_version = mapping_table[iNum].version;
+                    internal_read(iNum, old_file_fh, tmp_version, "", buf, SECTOR_SIZE, cur_process_offset, io_size, real_io_size);
                     // calculate new FP
                     char tmp_fp[SHA_DIGEST_LENGTH];
                     SHA1((const unsigned char *)buf, SECTOR_SIZE, (unsigned char *)tmp_fp);
@@ -132,7 +133,8 @@ void rewrite_handler(std::map<INUM_TYPE, std::set<off_t>> rewrite_map){
                     #else
                     char buf[SECTOR_SIZE];
                     size_t io_size, real_io_size;   // just for internal_read
-                    internal_read(iNum, old_file_fh, buf, SECTOR_SIZE, cur_process_offset, io_size, real_io_size);
+                    uint32_t tmp_version = mapping_table[iNum].version;
+                    internal_read(iNum, old_file_fh, tmp_version, "", buf, SECTOR_SIZE, cur_process_offset, io_size, real_io_size);
                     real_rewrite_size += SECTOR_SIZE;
                     pwrite(rewrite_fh, buf, SECTOR_SIZE, rewrite_file_size);
                     src_off = rewrite_file_size;
