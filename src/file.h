@@ -313,7 +313,7 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
                 for (off_t LPA = offset / SECTOR_SIZE; LPA < (offset + (off_t)size + SECTOR_SIZE - 1) / SECTOR_SIZE; LPA++) {
                     off_t page_offset = LPA * SECTOR_SIZE;
                     off_t buf_off = page_offset - offset;
-                    if (buf_off < 0 || buf_off + SECTOR_SIZE > (off_t)size) continue;
+                    if (buf_off < 0 || buf_off + SECTOR_SIZE > offset + (off_t)size) continue;
                     // skip pages that are already sector-aligned in the virtual file
                     // (reading them causes no amplification, so rewriting them is unnecessary)
                     GROUP_IDX_TYPE gidx = mapping_table[iNum].group_idx[LPA];
