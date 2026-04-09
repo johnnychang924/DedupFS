@@ -33,13 +33,15 @@ LFUList lfu;
 uint64_t total_rewrite_size = 0;    // Total rewrite size(include duplicate page)
 uint64_t real_rewrite_size = 0;     // real rewrite size to the disk(exclude deuplicate page)
 
+int virtual_file_read_fh[MAX_INODE_NUM] = { 0 };
+
 extern mapping_table_entry mapping_table[MAX_INODE_NUM];
 extern std::shared_mutex mapping_table_mutex[MAX_INODE_NUM];
 extern inline PATH_TYPE get_path(INUM_TYPE iNum);
 extern inline int build_virtual_file(INUM_TYPE iNum, int fh);
 extern inline int build_virtual_file(mapping_table_entry& entry, int fh);
 extern inline INUM_TYPE get_inum(PATH_TYPE path_str);
-extern inline int internal_read(INUM_TYPE iNum, int &fh, uint32_t &version, const char *path, char *buf, size_t size, off_t offset, size_t &io_size, size_t &real_io_size);
+extern inline int internal_read(INUM_TYPE iNum, int fh, char *buf, size_t size, off_t offset, size_t &io_size, size_t &real_io_size);
 
 void rewrite_handler(std::map<INUM_TYPE, std::set<off_t>> rewrite_map){
     // rewrite file handler
@@ -114,8 +116,7 @@ void rewrite_handler(std::map<INUM_TYPE, std::set<off_t>> rewrite_map){
                     // write out need to rewrite page
                     char buf[SECTOR_SIZE];
                     size_t io_size, real_io_size;   // just for internal_read
-                    uint32_t tmp_version = mapping_table[iNum].version;
-                    internal_read(iNum, old_file_fh, tmp_version, "", buf, SECTOR_SIZE, cur_process_offset, io_size, real_io_size);
+                    internal_read(iNum, old_file_fh, buf, SECTOR_SIZE, cur_process_offset, io_size, real_io_size);
                     // calculate new FP
                     char tmp_fp[SHA_DIGEST_LENGTH];
                     SHA1((const unsigned char *)buf, SECTOR_SIZE, (unsigned char *)tmp_fp);
@@ -133,8 +134,7 @@ void rewrite_handler(std::map<INUM_TYPE, std::set<off_t>> rewrite_map){
                     #else
                     char buf[SECTOR_SIZE];
                     size_t io_size, real_io_size;   // just for internal_read
-                    uint32_t tmp_version = mapping_table[iNum].version;
-                    internal_read(iNum, old_file_fh, tmp_version, "", buf, SECTOR_SIZE, cur_process_offset, io_size, real_io_size);
+                    internal_read(iNum, old_file_fh, buf, SECTOR_SIZE, cur_process_offset, io_size, real_io_size);
                     real_rewrite_size += SECTOR_SIZE;
                     pwrite(rewrite_fh, buf, SECTOR_SIZE, rewrite_file_size);
                     src_off = rewrite_file_size;
@@ -329,10 +329,17 @@ void inline_rewrite_handler(INUM_TYPE iNum, std::set<std::pair<off_t, char*>, Re
     // the rename, or they would use new virtual offsets against the old inode
     {
         std::unique_lock<std::shared_mutex> write_lock(mapping_table_mutex[iNum]);
+        if (rename(full_shadow_file_name.c_str(), full_file_path.c_str()) != 0) {
+            return;
+        }
         mapping_table[iNum] = new_mapping_table_entry;
-        mapping_table[iNum].version++;
-        remove(full_file_path.c_str());
-        rename(full_shadow_file_name.c_str(), full_file_path.c_str());
+        // update global read fh to point to the new inode
+        int new_read_fh = open(full_file_path.c_str(), O_RDONLY);
+        if (new_read_fh != -1) {
+            int old_read_fh = virtual_file_read_fh[iNum];
+            virtual_file_read_fh[iNum] = new_read_fh;
+            if (old_read_fh > 0) close(old_read_fh);
+        }
     }
     close(rewrite_fh);
 }

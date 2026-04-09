@@ -114,7 +114,6 @@ inline void init_file_handler(const char *path, FILE_HANDLER_INDEX_TYPE file_han
         .fh = real_file_handler,
         .csfh = chunk_store_file_handler,
         .mode = mode,
-        .version = mapping_table[iNum].version,
     };
     if (mode == 'w'){
         file_handler[file_handler_index].write_buf = {
@@ -169,9 +168,11 @@ static int dedupfs_create(const char *path, mode_t mode, struct fuse_file_info *
     fi->fh = get_free_file_handler();
     if (fi->fh == (FILE_HANDLER_INDEX_TYPE)-1) return -errno;
     init_file_handler(path, fi->fh, real_file_handler, chunk_store_file_handler, 'w');
-    // force real file to shift
-    // mapping_table[file_handler[fi->fh].iNum].real_size += 512;
-    // ftruncate(chunk_store_file_handler, mapping_table[fi->fh].real_size);
+    // init global read fh for this inode (same inode survives build_virtual_file)
+    INUM_TYPE iNum = file_handler[fi->fh].iNum;
+    int old_read_fh = virtual_file_read_fh[iNum];
+    virtual_file_read_fh[iNum] = open(full_path, O_RDONLY);
+    if (old_read_fh > 0) close(old_read_fh);
     return 0;
 }
 
@@ -197,19 +198,8 @@ static int dedupfs_open(const char *path, struct fuse_file_info *fi) {
     return 0;
 }
 // for dedupfs internal read
-inline int internal_read(INUM_TYPE iNum, int &fh, uint32_t &version, const char *path, char *buf, size_t size, off_t offset, size_t &io_size, size_t &real_io_size){
+inline int internal_read(INUM_TYPE iNum, int fh, char *buf, size_t size, off_t offset, size_t &io_size, size_t &real_io_size){
     std::shared_lock<std::shared_mutex> read_lock(mapping_table_mutex[iNum]);
-    // check if inline rewrite has replaced the virtual file since this fh was opened
-    if (version != mapping_table[iNum].version){
-        char full_path[1024];
-        snprintf(full_path, sizeof(full_path), "%s%s", BACKEND, path);
-        int new_fh = open(full_path, O_RDONLY);
-        if (new_fh != -1){
-            close(fh);
-            fh = new_fh;
-            version = mapping_table[iNum].version;
-        }
-    }
     // find first block group index
     GROUP_IDX_TYPE start_group_idx = mapping_table[iNum].group_idx[offset / CHUNK_SIZE];
     while (true) {
@@ -297,7 +287,7 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
 
     size_t real_io_size = 0;
     size_t io_size = 0;
-    int ret = internal_read(iNum, file_handler[fi->fh].fh, file_handler[fi->fh].version, path, buf, size, offset, io_size, real_io_size);
+    int ret = internal_read(iNum, virtual_file_read_fh[iNum], buf, size, offset, io_size, real_io_size);
     if (ret == 0)
         return ret;     // something went wrong, return the process to prevent more system damage
     #ifdef INLINE_REWRITE
