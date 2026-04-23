@@ -3,10 +3,15 @@
 #include <chrono>
 #include <cmath>
 #include <shared_mutex>
+#ifdef RECORD_PAGE_SCORE
+#include <algorithm>
+#include <fstream>
+#include <vector>
+#endif
 
 #include "def.h"
 
-using TimePoint = std::chrono::system_clock::time_point;
+using TimePoint = std::chrono::high_resolution_clock::time_point;
 using ScoreType = float;
 
 class FreqTracker{
@@ -32,6 +37,19 @@ public:
         std::unique_lock<std::shared_mutex> lock(mutex);
         score_table.erase(LPA);
     }
+    #ifdef RECORD_PAGE_SCORE
+    void dump_scores(const char* path){
+        std::unique_lock<std::shared_mutex> lock(mutex);
+        std::vector<std::pair<uint64_t, ScoreType>> entries;
+        entries.reserve(score_table.size());
+        for (const auto& kv : score_table)
+            entries.push_back({kv.first, kv.second.first});
+        std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b){ return a.second < b.second; });
+        std::ofstream out(path);
+        for (const auto& e : entries)
+            out << e.first << " " << e.second << "\n";
+    }
+    #endif
 private:
     std::unordered_map<uint64_t, std::pair<ScoreType, TimePoint>> score_table;
     std::shared_mutex mutex;

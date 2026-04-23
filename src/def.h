@@ -53,13 +53,18 @@
 #define GROUP_IDX_TYPE uint32_t
 
 // freq tracker
-#define DECAY_FACTOR 0.9
-#define TIME_INTERVAL 60000000
+#define DECAY_FACTOR 0.95
+#define TIME_INTERVAL 60000000      // 1 minutes
+// #define RECORD_PAGE_SCORE
+#define RECORD_PAGE_SCORE_PATH "/home/johnnychang/result/fuse.pgscore"
+
 
 // inline rewrite threshold
-#define PAGE_READ_LATENCY 50000
+#define PAGE_READ_LATENCY 58000
 #define PAGE_WRITE_LATENCY 561000
 #define INLINE_REWRITE_THRESHOLD (PAGE_WRITE_LATENCY / PAGE_READ_LATENCY)
+#define INLINE_REWRITE_QUEUE_MAX 262144
+#define INLINE_REWRITE_INTERVAL 5       // seconds to wait between each rewrite pass
 
 // struct define
 struct chunk_addr{
@@ -73,6 +78,7 @@ struct hash_store_entry{
 };
 struct mapping_table_entry{
     std::vector<GROUP_IDX_TYPE> group_idx;              // the group index of each "BLOCK"
+    std::vector<bool> has_rewrite;
     std::vector<off_t> group_logical_offset;            // the logical start byte of every group in this file
     std::vector<off_t> group_virtual_offset;            // the virtual start byte of every group in this file
     std::vector<chunk_addr*> group_pos;                 // The real position of every Group

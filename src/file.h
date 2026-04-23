@@ -241,7 +241,7 @@ inline int internal_read(INUM_TYPE iNum, int fh, char *buf, size_t size, off_t o
     // read into temp buffer
     char tmp_buf[io_size];
     DEBUG_MESSAGE("  start reading offset->" << io_off << " size->" << io_size);
-    int res = pread(fh, tmp_buf, io_size, io_off);
+    int res = pread(virtual_file_read_fh[iNum], tmp_buf, io_size, io_off);
     if ((size_t)res != io_size){
         PRINT_WARNING("Can not read enough chunk from virtual file, should read " << io_size << ", but " << res);
     }
@@ -291,26 +291,28 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     if (ret == 0)
         return ret;     // something went wrong, return the process to prevent more system damage
     #ifdef INLINE_REWRITE
-    if (io_size != size) {
+    if (io_size != size && running) {
         float min_score = std::numeric_limits<float>::max();
         for (off_t LPA = offset / SECTOR_SIZE; LPA < (offset + (off_t)size + SECTOR_SIZE - 1) / SECTOR_SIZE; LPA++)
             min_score = std::min(min_score, freq_tracker.read((uint64_t)iNum << 32 | LPA));
-        if (min_score > INLINE_REWRITE_THRESHOLD) {
+        float extra_read_pages = (float)(io_size - size) / SECTOR_SIZE;
+        if (min_score * extra_read_pages * 2 > INLINE_REWRITE_THRESHOLD) {
             // phase 1: build rewrite requests under mapping table shared lock only
             std::vector<rewrite_req_struct> pending;
             {
                 std::shared_lock<std::shared_mutex> read_lock(mapping_table_mutex[iNum]);
                 for (off_t LPA = offset / SECTOR_SIZE; LPA < (offset + (off_t)size + SECTOR_SIZE - 1) / SECTOR_SIZE; LPA++) {
+                    if (mapping_table[iNum].has_rewrite.size() <= (uint64_t)LPA || mapping_table[iNum].has_rewrite[LPA]) continue;
                     off_t page_offset = LPA * SECTOR_SIZE;
                     off_t buf_off = page_offset - offset;
                     if (buf_off < 0 || buf_off + SECTOR_SIZE > offset + (off_t)size) continue;
                     // skip pages that are already sector-aligned in the virtual file
                     // (reading them causes no amplification, so rewriting them is unnecessary)
-                    GROUP_IDX_TYPE gidx = mapping_table[iNum].group_idx[LPA];
+                    /*GROUP_IDX_TYPE gidx = mapping_table[iNum].group_idx[LPA];
                     off_t front_gap = page_offset - mapping_table[iNum].group_logical_offset[gidx];
                     off_t virt_start = mapping_table[iNum].group_virtual_offset[gidx] + front_gap;
                     if ((size_t)front_gap + SECTOR_SIZE <= mapping_table[iNum].group_pos[gidx]->length
-                        && virt_start % SECTOR_SIZE == 0) continue;
+                        && virt_start % SECTOR_SIZE == 0) continue;*/
                     rewrite_req_struct req;
                     req.iNum = iNum;
                     req.logical_offset = page_offset;
@@ -322,8 +324,12 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
             if (!pending.empty()) {
                 {
                     std::unique_lock<std::shared_mutex> queue_lock(inline_rewrite_mutex);
-                    for (auto& req : pending)
-                        inline_rewrite_queue.push(std::move(req));
+                    if (inline_rewrite_queue.size() < INLINE_REWRITE_QUEUE_MAX){
+                        for (auto& req : pending) {
+                            mapping_table[req.iNum].has_rewrite[req.logical_offset / SECTOR_SIZE] = true;
+                            inline_rewrite_queue.push_back(std::move(req));
+                        }
+                    }
                 }
                 inline_rewrite_cv.notify_one();
             }
@@ -540,6 +546,7 @@ inline int flush_buffer(buffer_entry *buf, INUM_TYPE iNum, int csfh, FILE_HANDLE
     }
     for(GROUP_IDX_TYPE i = mapping_table[iNum].group_idx.size(); i <= (buf->start_byte + cut_pos - 1) / CHUNK_SIZE; i++){
         mapping_table[iNum].group_idx.push_back(mapping_table[iNum].group_pos.size() - 1);
+        mapping_table[iNum].has_rewrite.push_back(false);
         #ifdef RECORD_LATENCY
         each_file_read_bandwidth[iNum].lat.push_back(0);
         each_file_read_bandwidth[iNum].count.push_back(0);
