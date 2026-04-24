@@ -49,7 +49,7 @@ std::shared_mutex mapping_table_mutex[MAX_INODE_NUM];   // per-file lock: shared
 // fastCDC chunker
 fcdc_ctx cdc, *ctx;
 
-#ifdef INLINE_REWRITE
+#if defined(INLINE_REWRITE) || defined(REWRITE)
 FreqTracker freq_tracker;
 #endif
 
@@ -290,13 +290,13 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     int ret = internal_read(iNum, virtual_file_read_fh[iNum], buf, size, offset, io_size, real_io_size);
     if (ret == 0)
         return ret;     // something went wrong, return the process to prevent more system damage
-    #ifdef INLINE_REWRITE
+    #if defined(INLINE_REWRITE) || defined(REWRITE)
     if (io_size != size && running) {
         float min_score = std::numeric_limits<float>::max();
         for (off_t LPA = offset / SECTOR_SIZE; LPA < (offset + (off_t)size + SECTOR_SIZE - 1) / SECTOR_SIZE; LPA++)
             min_score = std::min(min_score, freq_tracker.read((uint64_t)iNum << 32 | LPA));
         float extra_read_pages = (float)(io_size - size) / SECTOR_SIZE;
-        if (min_score * extra_read_pages * 2 > INLINE_REWRITE_THRESHOLD) {
+        if (min_score * extra_read_pages > INLINE_REWRITE_THRESHOLD) {
             // phase 1: build rewrite requests under mapping table shared lock only
             std::vector<rewrite_req_struct> pending;
             {
@@ -324,14 +324,16 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
             if (!pending.empty()) {
                 {
                     std::unique_lock<std::shared_mutex> queue_lock(inline_rewrite_mutex);
-                    if (inline_rewrite_queue.size() < INLINE_REWRITE_QUEUE_MAX){
+                    if (rewrite_queue.size() < INLINE_REWRITE_QUEUE_MAX){
                         for (auto& req : pending) {
                             mapping_table[req.iNum].has_rewrite[req.logical_offset / SECTOR_SIZE] = true;
-                            inline_rewrite_queue.push_back(std::move(req));
+                            rewrite_queue.push_back(std::move(req));
                         }
                     }
                 }
+                #ifdef INLINE_REWRITE
                 inline_rewrite_cv.notify_one();
+                #endif
             }
         }
     }
