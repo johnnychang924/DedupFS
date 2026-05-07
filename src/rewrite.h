@@ -44,58 +44,6 @@ extern inline PATH_TYPE get_path(INUM_TYPE iNum);
 extern inline int build_virtual_file(mapping_table_entry& entry, int fh);
 extern inline INUM_TYPE get_inum(PATH_TYPE path_str);
 
-// only for debug
-/*void verify_rewrite(mapping_table_entry &old_mapping_entry, mapping_table_entry &new_mapping_entry){
-    PRINT_WARNING("Start verify group integrity");
-    // verity group length
-    uint64_t group_len = new_mapping_entry.group_logical_offset.size();
-    if (new_mapping_entry.group_pos.size() != group_len || new_mapping_entry.group_virtual_offset.size() != group_len){
-        PRINT_WARNING("group len not allign");
-        PRINT_WARNING("group_logical_offset len: " << new_mapping_entry.group_logical_offset.size());
-        PRINT_WARNING("group_pos len: " << new_mapping_entry.group_pos.size());
-        PRINT_WARNING("group_virtual_offset len: " << new_mapping_entry.group_virtual_offset.size());
-        return;
-    }
-    // verify group logical continous
-    off_t cur_off = 0;
-    for (GROUP_IDX_TYPE group_idx = 0; group_idx < new_mapping_entry.group_logical_offset.size(); group_idx++){
-        off_t group_start_off = new_mapping_entry.group_logical_offset[group_idx];
-        size_t group_len = new_mapping_entry.group_pos[group_idx]->length;
-        bool failed = false;
-        if (cur_off != group_start_off){
-            PRINT_WARNING("last group end != cur group start");
-            PRINT_WARNING("last group end: " << cur_off);
-            PRINT_WARNING("cur group start: " << group_start_off);
-            failed = true;
-        }
-        if (group_len == 0 || group_len > MAX_GROUP_SIZE){
-            PRINT_WARNING("group len looks strange");
-            PRINT_WARNING("group len: " << group_len);
-            failed = true;
-        }
-        if (failed) return;
-        cur_off = group_start_off + group_len;
-    }
-    // verify virtual file
-    if (new_mapping_entry.completed_link != group_len){
-        PRINT_WARNING("virtual file is not completely build");
-        return;
-    }
-    // verify group status
-    if (new_mapping_entry.logical_size != old_mapping_entry.logical_size){
-        PRINT_WARNING("logical size change!!");
-        return;
-    }
-    uint64_t group_logical_sector_count = (new_mapping_entry.logical_size + SECTOR_SIZE - 1) / SECTOR_SIZE;
-    if (new_mapping_entry.has_rewrite.size() != group_logical_sector_count){
-        PRINT_WARNING("has_rewrite entry not allign");
-        PRINT_WARNING("group_logical_sector_count: " << group_logical_sector_count);
-        PRINT_WARNING("has_rewrite count: " << new_mapping_entry.has_rewrite.size());
-        return;
-    }
-    PRINT_WARNING("mapping looks healthy");
-}*/
-
 bool running = true;
 
 /*
@@ -215,14 +163,11 @@ void rewrite_handler(INUM_TYPE iNum, std::set<std::pair<off_t, off_t>, RewriteCh
     if (old_read_fh > 0) close(old_read_fh);
 }
 
-
-//std::queue<rewrite_req_struct> inline_rewrite_queue;
-std::shared_mutex inline_rewrite_mutex;
 std::condition_variable_any inline_rewrite_cv;
-
-// 全域宣告改成 std::deque
+std::shared_mutex rewrite_queue_mutex;
 std::deque<rewrite_req_struct> rewrite_queue;
 
+// inline rewrite worker
 void inline_rewrite_worker(){
     int rewrite_fh = open(BACKEND CHUNK_STORE REWRITE_FILE_PATH, O_RDWR | O_CREAT, 0666);
     INUM_TYPE rewrite_file_iNum = get_inum(REWRITE_FILE_PATH);
@@ -234,7 +179,7 @@ void inline_rewrite_worker(){
     while (running){
         std::deque<rewrite_req_struct> local_batch;
         {
-            std::unique_lock<std::shared_mutex> lock(inline_rewrite_mutex);
+            std::unique_lock<std::shared_mutex> lock(rewrite_queue_mutex);
             inline_rewrite_cv.wait(lock, []{ return rewrite_queue.size() > 1024 || !running; });
             if (!running) break;
             std::swap(local_batch, rewrite_queue);
@@ -296,7 +241,7 @@ void rewrite(){
     }
     std::deque<rewrite_req_struct> local_batch;
     {
-        std::unique_lock<std::shared_mutex> lock(inline_rewrite_mutex);
+        std::unique_lock<std::shared_mutex> lock(rewrite_queue_mutex);
         if (rewrite_queue.empty()) [[unlikely]] {
             close(rewrite_fh);
             PRINT_WARNING("Rewrite queue is empty!!");

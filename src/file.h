@@ -323,7 +323,7 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
             // phase 2: push to queue under exclusive lock (brief critical section)
             if (!pending.empty()) {
                 {
-                    std::unique_lock<std::shared_mutex> queue_lock(inline_rewrite_mutex);
+                    std::unique_lock<std::shared_mutex> queue_lock(rewrite_queue_mutex);
                     if (rewrite_queue.size() < INLINE_REWRITE_QUEUE_MAX){
                         for (auto& req : pending) {
                             mapping_table[req.iNum].has_rewrite[req.logical_offset / SECTOR_SIZE] = true;
