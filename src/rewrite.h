@@ -40,11 +40,13 @@ int virtual_file_read_fh[MAX_INODE_NUM] = { 0 };
 
 extern mapping_table_entry mapping_table[MAX_INODE_NUM];
 extern std::shared_mutex mapping_table_mutex[MAX_INODE_NUM];
+extern std::shared_mutex mapping_table_remap_mutex[MAX_INODE_NUM];
 extern inline PATH_TYPE get_path(INUM_TYPE iNum);
 extern inline int build_virtual_file(mapping_table_entry& entry, int fh);
 extern inline INUM_TYPE get_inum(PATH_TYPE path_str);
 
 bool running = true;
+int rewrite_fh;
 
 /*
 * rewrite the offset in a single file(thread safe)
@@ -167,9 +169,67 @@ std::condition_variable_any inline_rewrite_cv;
 std::shared_mutex rewrite_queue_mutex;
 std::deque<rewrite_req_struct> rewrite_queue;
 
+//remap rewrite
+void remap_rewrite_worker(){
+    rewrite_fh = open(BACKEND CHUNK_STORE REWRITE_FILE_PATH, O_RDWR | O_CREAT, 0666);
+
+    if (rewrite_fh == -1){
+        PRINT_WARNING("Critical Error: Can not open rewrite file handler in inline rewrite worker");
+        return;
+    }
+    while (running){
+        std::deque<rewrite_req_struct> local_batch;
+        {
+            std::unique_lock<std::shared_mutex> lock(rewrite_queue_mutex);
+            inline_rewrite_cv.wait(lock, []{ return rewrite_queue.size() > 1024 || !running; });
+            if (!running) break;
+            std::swap(local_batch, rewrite_queue);
+        }
+        
+        // Group requests by iNum. Deduplicate by logical_offset only, ignoring buffer pointer.
+        // char* points into local_batch's stable storage; deque iterators/references remain
+        // valid as long as we don't push/pop on local_batch itself.
+        std::map<INUM_TYPE, std::set<std::pair<off_t, off_t>, RewriteChunkCmp>> rewrite_map;
+        for (auto& req : local_batch) {
+            if (!running) [[unlikely]] break;
+            off_t src_off;
+            #ifdef REWRITE_DEDUP
+            char tmp_fp[SHA_DIGEST_LENGTH];
+            SHA1((const unsigned char *)req.buffer, SECTOR_SIZE, (unsigned char *)tmp_fp);
+            FP_TYPE fp(tmp_fp, SHA_DIGEST_LENGTH);
+            // check FP exist in rewrite file
+            auto fp_store_iter = rewrite_fp_store.find(fp);
+            if (fp_store_iter == rewrite_fp_store.end()){   // not found
+                rewrite_fp_store[fp] = rewrite_file_size;
+                pwrite(rewrite_fh, req.buffer, SECTOR_SIZE, rewrite_file_size);
+                real_rewrite_size += SECTOR_SIZE;
+                src_off = rewrite_file_size;
+                rewrite_file_size += SECTOR_SIZE;
+            }
+            else src_off = fp_store_iter->second;
+            #else
+            pwrite(rewrite_fh, req.buffer, SECTOR_SIZE, rewrite_file_size);
+            real_rewrite_size += SECTOR_SIZE;
+            src_off = rewrite_file_size;
+            rewrite_file_size += SECTOR_SIZE;
+            #endif
+            rewrite_map[req.iNum].insert({req.logical_offset, src_off});
+        }
+        for (auto& [iNum, chunks] : rewrite_map){
+            if (!running) [[unlikely]] break;
+            max_inline_rewrite_chunks = std::max(max_inline_rewrite_chunks, (uint64_t)chunks.size());
+            total_rewrite_size += chunks.size() * SECTOR_SIZE;
+            std::unique_lock<std::shared_mutex> write_lock(mapping_table_remap_mutex[iNum]);
+            for (auto &[logical_offset, src_off]: chunks){
+                mapping_table[iNum].remap[logical_offset] = src_off;
+            }
+        }
+    }
+}
+
 // inline rewrite worker
 void inline_rewrite_worker(){
-    int rewrite_fh = open(BACKEND CHUNK_STORE REWRITE_FILE_PATH, O_RDWR | O_CREAT, 0666);
+    rewrite_fh = open(BACKEND CHUNK_STORE REWRITE_FILE_PATH, O_RDWR | O_CREAT, 0666);
     INUM_TYPE rewrite_file_iNum = get_inum(REWRITE_FILE_PATH);
 
     if (rewrite_fh == -1){

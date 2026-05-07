@@ -155,6 +155,12 @@ int main(int argc, char *argv[]) {
             PRINT_MESSAGE("enable rewrite deduplication!!");
         #endif
     #endif
+    #ifdef INLINE_REWRITE
+        PRINT_MESSAGE("enable inline rewrite!!");
+        #ifdef USING_REMAP
+            PRINT_MESSAGE("enable remap!!");
+        #endif
+    #endif
     #ifdef RECORD_LATENCY
         PRINT_MESSAGE("enable record latency!!");
     #endif
@@ -178,7 +184,11 @@ int main(int argc, char *argv[]) {
     ctx = &cdc;
     // start rewrite worker thread
     #ifdef INLINE_REWRITE
+    #ifdef USING_REMAP
+    rewrite_thread = std::thread(remap_rewrite_worker);
+    #else
     rewrite_thread = std::thread(inline_rewrite_worker);
+    #endif
     #endif
     // start FUSE daemon
     return fuse_main(argc, argv, &dedupfs_oper, NULL);

@@ -10,6 +10,7 @@
 
 // rewrite
 // #define REWRITE
+// #define USING_REMAP
 // #define INLINE_REWRITE
 // #define REWRITE_DEDUP
 #define REWRITE_FILE_PATH "/rewrite"
@@ -86,6 +87,7 @@ struct mapping_table_entry{
     size_t logical_size = 0;                            // the file size host will see(before dedup)
     size_t virtual_size = 0;                            // how many chunk have been reflink into virtual file(in bytes)
     size_t real_size = 0;                               // how many size has been used in real file
+    std::unordered_map<off_t, off_t> remap;             // remap rewrite chunk
 };
 struct buffer_entry{
     off_t start_byte;       // which bytes to start

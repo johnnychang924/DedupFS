@@ -45,7 +45,8 @@ std::shared_mutex file_handler_mutex;   // the lock for allocate file handler an
 std::shared_mutex chunker_mutex;        // the lock for access chunker
 std::shared_mutex write_record_mutex;  // the lock for recording file system status
 std::shared_mutex read_record_mutex;    // the lock for record host/fuse/ssd read size
-std::shared_mutex mapping_table_mutex[MAX_INODE_NUM];   // per-file lock: shared for reads, exclusive for inline rewrite
+std::shared_mutex mapping_table_mutex[MAX_INODE_NUM];           // per-file lock: shared for reads, exclusive for inline rewrite
+std::shared_mutex mapping_table_remap_mutex[MAX_INODE_NUM];     // per-file lock: protect remap
 // fastCDC chunker
 fcdc_ctx cdc, *ctx;
 
@@ -287,7 +288,69 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
 
     size_t real_io_size = 0;
     size_t io_size = 0;
-    int ret = internal_read(iNum, virtual_file_read_fh[iNum], buf, size, offset, io_size, real_io_size);
+    int ret;
+    #if defined(USING_REMAP) && defined(INLINE_REWRITE)
+    {
+        off_t end = std::min(offset + (off_t)size, (off_t)mapping_table[iNum].logical_size);
+        // snapshot in-range remap entries, then release the lock immediately
+        std::vector<std::pair<off_t, off_t>> snapshot;
+        snapshot.reserve(((end - offset / SECTOR_SIZE * SECTOR_SIZE) + SECTOR_SIZE - 1) / SECTOR_SIZE);
+        {
+            std::shared_lock<std::shared_mutex> remap_lock(mapping_table_remap_mutex[iNum]);
+            auto& remap = mapping_table[iNum].remap;
+            for (off_t pg = (offset / SECTOR_SIZE) * SECTOR_SIZE; pg < end; pg += SECTOR_SIZE) {
+                auto it = remap.find(pg);
+                if (it != remap.end()) snapshot.emplace_back(pg, it->second);
+            }
+        }
+        int total_read = 0;
+        size_t snap_idx = 0;
+        off_t cur = offset;
+        while (cur < end) {
+            off_t page_off = cur / SECTOR_SIZE * SECTOR_SIZE;
+            if (snap_idx < snapshot.size() && snapshot[snap_idx].first == page_off) {
+                // remapped run: extend while contiguous in both logical and physical space
+                off_t run_logical_start = page_off;
+                off_t run_src_start = snapshot[snap_idx].second;
+                size_t run_pages = 1;
+                while (snap_idx + run_pages < snapshot.size() &&
+                       snapshot[snap_idx + run_pages].first == run_logical_start + (off_t)(run_pages * SECTOR_SIZE) &&
+                       snapshot[snap_idx + run_pages].second == run_src_start + (off_t)(run_pages * SECTOR_SIZE)) {
+                    ++run_pages;
+                }
+                off_t run_logical_end = run_logical_start + (off_t)(run_pages * SECTOR_SIZE);
+                off_t in_run_offset = cur - run_logical_start;
+                size_t copy_size = std::min(run_logical_end, end) - cur;
+                int res = pread(rewrite_fh, buf + (cur - offset), copy_size, run_src_start + in_run_offset);
+                if ((size_t)res != copy_size) [[unlikely]] {
+                    PRINT_WARNING("remap pread failed: read " << res << " expected " << copy_size);
+                    return 0;
+                }
+                io_size += copy_size;
+                real_io_size += copy_size;
+                total_read += copy_size;
+                cur += copy_size;
+                snap_idx += run_pages;
+            } else {
+                // non-remapped run: defer to internal_read up to next remapped page (or end)
+                off_t next_remap = (snap_idx < snapshot.size()) ? snapshot[snap_idx].first : end;
+                off_t run_end = std::min(next_remap, end);
+                size_t sub_io = 0, sub_real_io = 0;
+                int sub_ret = internal_read(iNum, virtual_file_read_fh[iNum],
+                                            buf + (cur - offset),
+                                            run_end - cur, cur, sub_io, sub_real_io);
+                if (sub_ret == 0) return 0;
+                io_size += sub_io;
+                real_io_size += sub_real_io;
+                total_read += sub_ret;
+                cur = run_end;
+            }
+        }
+        ret = total_read;
+    }
+    #else
+    ret = internal_read(iNum, virtual_file_read_fh[iNum], buf, size, offset, io_size, real_io_size);
+    #endif
     if (ret == 0)
         return ret;     // something went wrong, return the process to prevent more system damage
     #if defined(INLINE_REWRITE) || defined(REWRITE)
