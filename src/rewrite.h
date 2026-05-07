@@ -8,6 +8,8 @@
 #include <openssl/sha.h>
 #include <linux/fs.h>        /* Definition of FICLONE* constants */
 #include <sys/ioctl.h>
+#include <unordered_set>
+#include <thread>
 
 #include "lfu_list.h"
 #include "def.h"
@@ -21,7 +23,7 @@ struct rewrite_req_struct{
 // Compare only by logical_offset, ignoring buffer pointer,
 // so duplicate offsets are deduplicated in a set.
 struct RewriteChunkCmp {
-    bool operator()(const std::pair<off_t, char*>& a, const std::pair<off_t, char*>& b) const {
+    bool operator()(const std::pair<off_t, off_t>& a, const std::pair<off_t, off_t>& b) const {
         return a.first < b.first;
     }
 };
@@ -32,220 +34,108 @@ LFUList lfu;
 
 uint64_t total_rewrite_size = 0;    // Total rewrite size(include duplicate page)
 uint64_t real_rewrite_size = 0;     // real rewrite size to the disk(exclude deuplicate page)
+uint64_t max_inline_rewrite_chunks = 0; // max chunks processed in a single inline_rewrite_handler call
+
+int virtual_file_read_fh[MAX_INODE_NUM] = { 0 };
 
 extern mapping_table_entry mapping_table[MAX_INODE_NUM];
 extern std::shared_mutex mapping_table_mutex[MAX_INODE_NUM];
 extern inline PATH_TYPE get_path(INUM_TYPE iNum);
-extern inline int build_virtual_file(INUM_TYPE iNum, int fh);
 extern inline int build_virtual_file(mapping_table_entry& entry, int fh);
 extern inline INUM_TYPE get_inum(PATH_TYPE path_str);
-extern inline int internal_read(INUM_TYPE iNum, int fh, char *buf, size_t size, off_t offset, size_t &io_size, size_t &real_io_size);
 
-void rewrite_handler(std::map<INUM_TYPE, std::set<off_t>> rewrite_map){
-    // rewrite file handler
-    int rewrite_fh = open(BACKEND CHUNK_STORE REWRITE_FILE_PATH, O_RDWR | O_CREAT, 0666);
-    if (rewrite_fh == -1){
-        PRINT_WARNING("Can not open rewrite file");
+// only for debug
+/*void verify_rewrite(mapping_table_entry &old_mapping_entry, mapping_table_entry &new_mapping_entry){
+    PRINT_WARNING("Start verify group integrity");
+    // verity group length
+    uint64_t group_len = new_mapping_entry.group_logical_offset.size();
+    if (new_mapping_entry.group_pos.size() != group_len || new_mapping_entry.group_virtual_offset.size() != group_len){
+        PRINT_WARNING("group len not allign");
+        PRINT_WARNING("group_logical_offset len: " << new_mapping_entry.group_logical_offset.size());
+        PRINT_WARNING("group_pos len: " << new_mapping_entry.group_pos.size());
+        PRINT_WARNING("group_virtual_offset len: " << new_mapping_entry.group_virtual_offset.size());
         return;
     }
-    INUM_TYPE rewrite_file_iNum = get_inum(REWRITE_FILE_PATH);
-    // loop each file
-    for (const auto& pair : rewrite_map) {
-        // rename old virtual file & create new virtual file
-        INUM_TYPE iNum = pair.first;
-        std::string file_name = get_path(iNum);
-        if (file_name == ""){
-            PRINT_WARNING("can not find file path, iNum: " << iNum);
-            return;
+    // verify group logical continous
+    off_t cur_off = 0;
+    for (GROUP_IDX_TYPE group_idx = 0; group_idx < new_mapping_entry.group_logical_offset.size(); group_idx++){
+        off_t group_start_off = new_mapping_entry.group_logical_offset[group_idx];
+        size_t group_len = new_mapping_entry.group_pos[group_idx]->length;
+        bool failed = false;
+        if (cur_off != group_start_off){
+            PRINT_WARNING("last group end != cur group start");
+            PRINT_WARNING("last group end: " << cur_off);
+            PRINT_WARNING("cur group start: " << group_start_off);
+            failed = true;
         }
-        std::string old_file_name = file_name + "old";
-        std::string full_file_path = BACKEND CHUNK_STORE + file_name;
-        struct stat file_st;
-        if (stat(full_file_path.c_str(), &file_st) != 0) {
-            PRINT_WARNING("REWRITE failed: can not find file stat, path: " << full_file_path << " ,iNum: " << iNum);
-            return;
+        if (group_len == 0 || group_len > MAX_GROUP_SIZE){
+            PRINT_WARNING("group len looks strange");
+            PRINT_WARNING("group len: " << group_len);
+            failed = true;
         }
-        rename((BACKEND + file_name).c_str(), (BACKEND + old_file_name).c_str());
-        int file_fh = creat((BACKEND + file_name).c_str(), file_st.st_mode & 07777);
-        int old_file_fh = open((BACKEND + old_file_name).c_str(), O_RDONLY);
-        mapping_table_entry new_mapping_table_entry;
-        new_mapping_table_entry.logical_size = mapping_table[iNum].logical_size;
-        new_mapping_table_entry.real_size = mapping_table[iNum].real_size;
-        GROUP_IDX_TYPE cur_group_idx;
-        auto offset_it = pair.second.begin();
-        off_t prev_cur_process_offset = -1;  // for debug use
-        off_t cur_process_offset = 0;
-        // loop file's each group
-        for (cur_group_idx = 0; cur_group_idx < mapping_table[iNum].group_pos.size(); cur_group_idx++){
-            // check if this group needs to be rewritten
-            off_t start_group_offset = mapping_table[iNum].group_logical_offset[cur_group_idx];
-            off_t end_group_offset = start_group_offset + mapping_table[iNum].group_pos[cur_group_idx]->length;
-            INUM_TYPE group_ori_iNum = mapping_table[iNum].group_pos[cur_group_idx]->iNum;
-            while (cur_process_offset < end_group_offset){
-                //PRINT_MESSAGE("start_group_offset: " << start_group_offset << " cur_process_offset: " << cur_process_offset << " end_group_offset: " << end_group_offset);
-                bool need_rewrite = offset_it != pair.second.end() && *offset_it < end_group_offset;
-                need_rewrite = need_rewrite && *offset_it + SECTOR_SIZE <= (off_t)mapping_table[iNum].logical_size;
-                bool at_first = cur_process_offset == start_group_offset;
-                if (cur_process_offset <= prev_cur_process_offset) [[unlikely]] {
-                    PRINT_WARNING("rewrite error: cur_process_offset not moving forward");
-                    PRINT_WARNING("group_idx: " << cur_group_idx);
-                    PRINT_WARNING("start_group_offset: " << start_group_offset);
-                    PRINT_WARNING("prev_cur_process_offset: " << prev_cur_process_offset);
-                    PRINT_WARNING("cur_process_offset: " << cur_process_offset);
-                    PRINT_WARNING("end_group_offset: " << end_group_offset);
-                    PRINT_WARNING("next offset to rewrite: " << (offset_it != pair.second.end() ? *offset_it : -1));
-                    PRINT_WARNING("logical_size: " << mapping_table[iNum].logical_size);
-                    PRINT_WARNING("need_rewrite: " << need_rewrite);
-                    PRINT_WARNING("at_first: " << at_first);
-                    return;
-                }
-                prev_cur_process_offset = cur_process_offset;
-                if (at_first && !need_rewrite){
-                    // fast forward
-                    new_mapping_table_entry.group_logical_offset.push_back(start_group_offset);
-                    new_mapping_table_entry.group_pos.push_back(mapping_table[iNum].group_pos[cur_group_idx]);
-                    cur_process_offset = end_group_offset;
-                }
-                else if(need_rewrite && cur_process_offset == *offset_it){
-                    // rewrite page
-                    off_t src_off;
-                    total_rewrite_size += SECTOR_SIZE;
-                    #ifdef REWRITE_DEDUP
-                    // write out need to rewrite page
-                    char buf[SECTOR_SIZE];
-                    size_t io_size, real_io_size;   // just for internal_read
-                    internal_read(iNum, old_file_fh, buf, SECTOR_SIZE, cur_process_offset, io_size, real_io_size);
-                    // calculate new FP
-                    char tmp_fp[SHA_DIGEST_LENGTH];
-                    SHA1((const unsigned char *)buf, SECTOR_SIZE, (unsigned char *)tmp_fp);
-                    FP_TYPE fp(tmp_fp, SHA_DIGEST_LENGTH);
-                    // check FP exist in rewrite file
-                    auto fp_store_iter = rewrite_fp_store.find(fp);
-                    if (fp_store_iter == rewrite_fp_store.end()){
-                        real_rewrite_size += SECTOR_SIZE;
-                        pwrite(rewrite_fh, buf, SECTOR_SIZE, rewrite_file_size);
-                        rewrite_fp_store[fp] = rewrite_file_size;
-                        src_off = rewrite_file_size;
-                        rewrite_file_size += SECTOR_SIZE;
-                    }
-                    else src_off = fp_store_iter->second;
-                    #else
-                    char buf[SECTOR_SIZE];
-                    size_t io_size, real_io_size;   // just for internal_read
-                    internal_read(iNum, old_file_fh, buf, SECTOR_SIZE, cur_process_offset, io_size, real_io_size);
-                    real_rewrite_size += SECTOR_SIZE;
-                    pwrite(rewrite_fh, buf, SECTOR_SIZE, rewrite_file_size);
-                    src_off = rewrite_file_size;
-                    rewrite_file_size += SECTOR_SIZE;
-                    #endif
-                    chunk_addr *new_chunk_addr = new chunk_addr{ rewrite_file_iNum, src_off, SECTOR_SIZE };
-                    new_mapping_table_entry.group_logical_offset.push_back(cur_process_offset);
-                    new_mapping_table_entry.group_pos.push_back(new_chunk_addr);
-                    cur_process_offset += SECTOR_SIZE;
-                    offset_it++;
-                }
-                else{
-                    // create partial group
-                    uint16_t front_gap = cur_process_offset - start_group_offset;
-                    off_t new_group_pos_off = mapping_table[iNum].group_pos[cur_group_idx]->offset + front_gap;
-                    size_t new_group_len;
-                    if (need_rewrite)
-                        new_group_len = *offset_it - cur_process_offset;
-                    else
-                        new_group_len = end_group_offset - cur_process_offset;
-                    chunk_addr *new_chunk_addr = new chunk_addr{ group_ori_iNum, new_group_pos_off, new_group_len };
-                    new_mapping_table_entry.group_logical_offset.push_back(cur_process_offset);
-                    new_mapping_table_entry.group_pos.push_back(new_chunk_addr);
-                    cur_process_offset += new_group_len;
-                }
-                uint64_t end_logical_page = cur_process_offset / CHUNK_SIZE;
-                for(GROUP_IDX_TYPE i = new_mapping_table_entry.group_idx.size(); i <= end_logical_page; i++){
-                    new_mapping_table_entry.group_idx.push_back(new_mapping_table_entry.group_pos.size() - 1);
-                }
-            }
-        }
-        // update mapping table
-        mapping_table[iNum] = new_mapping_table_entry;
-        // rebuild ioctl
-        build_virtual_file(iNum, file_fh);
-        close(file_fh);
-        close(old_file_fh);
-        remove((BACKEND + old_file_name).c_str());
+        if (failed) return;
+        cur_off = group_start_off + group_len;
     }
-    close(rewrite_fh);
-}
+    // verify virtual file
+    if (new_mapping_entry.completed_link != group_len){
+        PRINT_WARNING("virtual file is not completely build");
+        return;
+    }
+    // verify group status
+    if (new_mapping_entry.logical_size != old_mapping_entry.logical_size){
+        PRINT_WARNING("logical size change!!");
+        return;
+    }
+    uint64_t group_logical_sector_count = (new_mapping_entry.logical_size + SECTOR_SIZE - 1) / SECTOR_SIZE;
+    if (new_mapping_entry.has_rewrite.size() != group_logical_sector_count){
+        PRINT_WARNING("has_rewrite entry not allign");
+        PRINT_WARNING("group_logical_sector_count: " << group_logical_sector_count);
+        PRINT_WARNING("has_rewrite count: " << new_mapping_entry.has_rewrite.size());
+        return;
+    }
+    PRINT_WARNING("mapping looks healthy");
+}*/
 
-// rewrite wrapper
-void rewrite(){
-    #ifdef REWRITE
-    DEBUG_MESSAGE("[rewrite]");
-    DEBUG_MESSAGE("Finding rewrite target");
-    // find need to rewrite chunk
-    std::map<INUM_TYPE, std::set<off_t>> rewrite_map;
-    uint64_t have_rewrite_page = 0;
-    std::vector<uint64_t> rewrite_target = lfu.topK(ONESHOT_REWRITE_COUNT);
-    for (auto lpa : rewrite_target) {
-        INUM_TYPE iNum = lpa >> 32;
-        off_t page_off = (lpa & 0xFFFFFFFF) * SECTOR_SIZE;
-        DEBUG_MESSAGE("  iNum: " << iNum << " LPA: " << page_off);
-        rewrite_map[iNum].insert(page_off);
-        have_rewrite_page += 1;
-    }
-    // call rewrite_handler
-    rewrite_handler(rewrite_map);
-    lfu.clear();
-    lfu.has_rewrite = true;
-    #else
-    PRINT_WARNING("rewrite is not enabled !!");
-    #endif
-}
+bool running = true;
 
 /*
 * rewrite the offset in a single file(thread safe)
 * @iNum: the file iNum of target file
 * @rewrite_chunk: the offset and content of the chunk to be rewrited
 */
-void inline_rewrite_handler(INUM_TYPE iNum, std::set<std::pair<off_t, char*>, RewriteChunkCmp> rewrite_chunk){
-    int rewrite_fh = open(BACKEND CHUNK_STORE REWRITE_FILE_PATH, O_RDWR | O_CREAT, 0666);
-    if (rewrite_fh == -1) [[unlikely]] {
-        PRINT_WARNING("Can not open rewrite file");
-        return;
-    }
-    INUM_TYPE rewrite_file_iNum = get_inum(REWRITE_FILE_PATH);
+void rewrite_handler(INUM_TYPE iNum, std::set<std::pair<off_t, off_t>, RewriteChunkCmp> rewrite_chunk, INUM_TYPE rewrite_file_iNum){
     std::string file_name = get_path(iNum);
     if (file_name == "") [[unlikely]] {
         PRINT_WARNING("can not find file path, iNum: " << iNum);
         return;
     }
     // create a shadow file to rebuild in the background
-    std::string shadow_file_name = file_name + "temp";
-    std::string full_shadow_file_name = BACKEND + shadow_file_name;
+    std::string shadow_file_name = file_name + ".temp";
+    std::string full_shadow_file_path = BACKEND + shadow_file_name;
     std::string full_file_path = BACKEND + file_name;
     struct stat file_st;
     if (stat(full_file_path.c_str(), &file_st) != 0) [[unlikely]] {
         PRINT_WARNING("REWRITE failed: can not find file stat, path: " << full_file_path << " ,iNum: " << iNum);
         return;
     }
-    int shadow_file_fh = creat(full_shadow_file_name.c_str(), file_st.st_mode & 07777);
+    int shadow_file_fh = creat(full_shadow_file_path.c_str(), file_st.st_mode & 07777);
     mapping_table_entry new_mapping_table_entry;
     GROUP_IDX_TYPE cur_group_idx;
     auto rewrite_chunk_it = rewrite_chunk.begin();
     off_t prev_cur_process_offset = -1;  // for debug use
     off_t cur_process_offset = 0;
-    // rebuild new_mapping_table_entry under shared lock to prevent concurrent writes from
-    // racing with our snapshot; released before build_virtual_file (slow ioctl)
     {
     std::shared_lock<std::shared_mutex> read_lock(mapping_table_mutex[iNum]);
     new_mapping_table_entry.logical_size = mapping_table[iNum].logical_size;
     new_mapping_table_entry.real_size = mapping_table[iNum].real_size;
     // loop file's each group
     for (cur_group_idx = 0; cur_group_idx < mapping_table[iNum].group_pos.size(); cur_group_idx++){
+        if (!running) return;
         // check if this group needs to be rewritten
         off_t start_group_offset = mapping_table[iNum].group_logical_offset[cur_group_idx];
         off_t end_group_offset = start_group_offset + mapping_table[iNum].group_pos[cur_group_idx]->length;
         INUM_TYPE group_ori_iNum = mapping_table[iNum].group_pos[cur_group_idx]->iNum;
         while (cur_process_offset < end_group_offset){
-            //PRINT_MESSAGE("start_group_offset: " << start_group_offset << " cur_process_offset: " << cur_process_offset << " end_group_offset: " << end_group_offset);
             bool need_rewrite = rewrite_chunk_it != rewrite_chunk.end() && rewrite_chunk_it->first < end_group_offset;
             need_rewrite = need_rewrite && rewrite_chunk_it->first + SECTOR_SIZE <= (off_t)mapping_table[iNum].logical_size;
             bool at_first = cur_process_offset == start_group_offset;
@@ -269,30 +159,7 @@ void inline_rewrite_handler(INUM_TYPE iNum, std::set<std::pair<off_t, char*>, Re
                 cur_process_offset = end_group_offset;
             }
             else if(need_rewrite && cur_process_offset == rewrite_chunk_it->first){     // rewrite page
-                off_t src_off;
-                total_rewrite_size += SECTOR_SIZE;
-                #ifdef REWRITE_DEDUP
-                // calculate new FP
-                char tmp_fp[SHA_DIGEST_LENGTH];
-                SHA1((const unsigned char *)rewrite_chunk_it->second, SECTOR_SIZE, (unsigned char *)tmp_fp);
-                FP_TYPE fp(tmp_fp, SHA_DIGEST_LENGTH);
-                // check FP exist in rewrite file
-                auto fp_store_iter = rewrite_fp_store.find(fp);
-                if (fp_store_iter == rewrite_fp_store.end()){
-                    real_rewrite_size += SECTOR_SIZE;
-                    pwrite(rewrite_fh, rewrite_chunk_it->second, SECTOR_SIZE, rewrite_file_size);
-                    rewrite_fp_store[fp] = rewrite_file_size;
-                    src_off = rewrite_file_size;
-                    rewrite_file_size += SECTOR_SIZE;
-                }
-                else src_off = fp_store_iter->second;
-                #else
-                real_rewrite_size += SECTOR_SIZE;
-                pwrite(rewrite_fh, rewrite_chunk_it->second, SECTOR_SIZE, rewrite_file_size);
-                src_off = rewrite_file_size;
-                rewrite_file_size += SECTOR_SIZE;
-                #endif
-                chunk_addr *new_chunk_addr = new chunk_addr{ rewrite_file_iNum, src_off, SECTOR_SIZE };
+                chunk_addr *new_chunk_addr = new chunk_addr{ rewrite_file_iNum, rewrite_chunk_it->second, SECTOR_SIZE };
                 new_mapping_table_entry.group_logical_offset.push_back(cur_process_offset);
                 new_mapping_table_entry.group_pos.push_back(new_chunk_addr);
                 cur_process_offset += SECTOR_SIZE;
@@ -306,6 +173,9 @@ void inline_rewrite_handler(INUM_TYPE iNum, std::set<std::pair<off_t, char*>, Re
                     new_group_len = rewrite_chunk_it->first - cur_process_offset;
                 else
                     new_group_len = end_group_offset - cur_process_offset;
+                if (new_group_len <= 0) [[unlikely]] {
+                    PRINT_WARNING("Invalid new_group_len: " << new_group_len);
+                }
                 chunk_addr *new_chunk_addr = new chunk_addr{ group_ori_iNum, new_group_pos_off, new_group_len };
                 new_mapping_table_entry.group_logical_offset.push_back(cur_process_offset);
                 new_mapping_table_entry.group_pos.push_back(new_chunk_addr);
@@ -322,49 +192,158 @@ void inline_rewrite_handler(INUM_TYPE iNum, std::set<std::pair<off_t, char*>, Re
     // (ioctl FICLONERANGE is slow; reads to iNum are unblocked during this phase)
     build_virtual_file(new_mapping_table_entry, shadow_file_fh);
     close(shadow_file_fh);
-    // swap mapping table, remove old virtual file, and rename shadow atomically under
-    // exclusive lock — read threads must not start between the mapping table swap and
-    // the rename, or they would use new virtual offsets against the old inode
+    int new_read_fh = open(full_shadow_file_path.c_str(), O_RDONLY);
+    if (new_read_fh == -1) [[unlikely]] {
+        PRINT_WARNING("REWRITE failed: cannot open shadow file for reading");
+        return;
+    }
+    // rename outside the lock — only changes dir entry, old fds still point to old inode
+    if (rename(full_shadow_file_path.c_str(), full_file_path.c_str()) != 0) [[unlikely]] {
+        PRINT_WARNING("REWRITE failed: cannot rename shadow file");
+        close(new_read_fh);
+        return;
+    }
+    // Exclusive lock only for the in-memory swap (mapping table + read fd)
+    int old_read_fh;
     {
         std::unique_lock<std::shared_mutex> write_lock(mapping_table_mutex[iNum]);
-        mapping_table[iNum] = new_mapping_table_entry;
-        mapping_table[iNum].version++;
-        remove(full_file_path.c_str());
-        rename(full_shadow_file_name.c_str(), full_file_path.c_str());
+        new_mapping_table_entry.has_rewrite = std::move(mapping_table[iNum].has_rewrite);
+        mapping_table[iNum] = std::move(new_mapping_table_entry);
+        old_read_fh = virtual_file_read_fh[iNum];
+        virtual_file_read_fh[iNum] = new_read_fh;
     }
-    close(rewrite_fh);
+    if (old_read_fh > 0) close(old_read_fh);
 }
 
 
-std::queue<rewrite_req_struct> inline_rewrite_queue;
+//std::queue<rewrite_req_struct> inline_rewrite_queue;
 std::shared_mutex inline_rewrite_mutex;
 std::condition_variable_any inline_rewrite_cv;
 
-bool running = true;
+// 全域宣告改成 std::deque
+std::deque<rewrite_req_struct> rewrite_queue;
 
-/*
-* An infinite loop keep doing rewrite
-*/
 void inline_rewrite_worker(){
+    int rewrite_fh = open(BACKEND CHUNK_STORE REWRITE_FILE_PATH, O_RDWR | O_CREAT, 0666);
+    INUM_TYPE rewrite_file_iNum = get_inum(REWRITE_FILE_PATH);
+
+    if (rewrite_fh == -1){
+        PRINT_WARNING("Critical Error: Can not open rewrite file handler in inline rewrite worker");
+        return;
+    }
     while (running){
-        std::vector<rewrite_req_struct> batch;
+        std::deque<rewrite_req_struct> local_batch;
         {
             std::unique_lock<std::shared_mutex> lock(inline_rewrite_mutex);
-            inline_rewrite_cv.wait(lock, []{ return !inline_rewrite_queue.empty() || !running; });
-            if (!running && inline_rewrite_queue.empty()) break;
-            while (!inline_rewrite_queue.empty()){
-                batch.push_back(std::move(inline_rewrite_queue.front()));
-                inline_rewrite_queue.pop();
+            inline_rewrite_cv.wait(lock, []{ return rewrite_queue.size() > 1024 || !running; });
+            if (!running) break;
+            std::swap(local_batch, rewrite_queue);
+        }
+        
+        // Group requests by iNum. Deduplicate by logical_offset only, ignoring buffer pointer.
+        // char* points into local_batch's stable storage; deque iterators/references remain
+        // valid as long as we don't push/pop on local_batch itself.
+        std::map<INUM_TYPE, std::set<std::pair<off_t, off_t>, RewriteChunkCmp>> rewrite_map;
+        for (auto& req : local_batch) {
+            if (!running) [[unlikely]] break;
+            off_t src_off;
+            #ifdef REWRITE_DEDUP
+            char tmp_fp[SHA_DIGEST_LENGTH];
+            SHA1((const unsigned char *)req.buffer, SECTOR_SIZE, (unsigned char *)tmp_fp);
+            FP_TYPE fp(tmp_fp, SHA_DIGEST_LENGTH);
+            // check FP exist in rewrite file
+            auto fp_store_iter = rewrite_fp_store.find(fp);
+            if (fp_store_iter == rewrite_fp_store.end()){   // not found
+                rewrite_fp_store[fp] = rewrite_file_size;
+                pwrite(rewrite_fh, req.buffer, SECTOR_SIZE, rewrite_file_size);
+                real_rewrite_size += SECTOR_SIZE;
+                src_off = rewrite_file_size;
+                rewrite_file_size += SECTOR_SIZE;
             }
+            else src_off = fp_store_iter->second;
+            #else
+            pwrite(rewrite_fh, req.buffer, SECTOR_SIZE, rewrite_file_size);
+            real_rewrite_size += SECTOR_SIZE;
+            src_off = rewrite_file_size;
+            rewrite_file_size += SECTOR_SIZE;
+            #endif
+            rewrite_map[req.iNum].insert({req.logical_offset, src_off});
         }
-        // group requests by iNum, using pointers into the stable batch vector
-        // Deduplicate by logical_offset only, ignoring buffer pointer.
-        std::map<INUM_TYPE, std::set<std::pair<off_t, char*>, RewriteChunkCmp>> rewrite_map;
-        for (auto& req : batch){
-            rewrite_map[req.iNum].insert({req.logical_offset, req.buffer});
-        }
+        
+        std::vector<std::thread> threads;
         for (auto& [iNum, chunks] : rewrite_map){
-            inline_rewrite_handler(iNum, chunks);
+            if (!running) [[unlikely]] break;
+            max_inline_rewrite_chunks = std::max(max_inline_rewrite_chunks, (uint64_t)chunks.size());
+            total_rewrite_size += chunks.size() * SECTOR_SIZE;
+            threads.emplace_back([&, iNum=iNum]{ 
+                rewrite_handler(iNum, chunks, rewrite_file_iNum);
+            });
         }
+        sleep(INLINE_REWRITE_INTERVAL);
+        for (auto& t : threads)
+            t.join();
     }
+}
+
+//out-of-line rewrite wrapper
+void rewrite(){
+    int rewrite_fh = open(BACKEND CHUNK_STORE REWRITE_FILE_PATH, O_RDWR | O_CREAT, 0666);
+    INUM_TYPE rewrite_file_iNum = get_inum(REWRITE_FILE_PATH);
+
+    if (rewrite_fh == -1){
+        PRINT_WARNING("Critical Error: Can not open rewrite file handler in inline rewrite worker");
+        return;
+    }
+    std::deque<rewrite_req_struct> local_batch;
+    {
+        std::unique_lock<std::shared_mutex> lock(inline_rewrite_mutex);
+        if (rewrite_queue.empty()) [[unlikely]] {
+            close(rewrite_fh);
+            PRINT_WARNING("Rewrite queue is empty!!");
+            return;
+        }
+        std::swap(local_batch, rewrite_queue);
+    }
+    
+    // Group requests by iNum. Deduplicate by logical_offset only, ignoring buffer pointer.
+    // char* points into local_batch's stable storage; deque iterators/references remain
+    // valid as long as we don't push/pop on local_batch itself.
+    std::map<INUM_TYPE, std::set<std::pair<off_t, off_t>, RewriteChunkCmp>> rewrite_map;
+    for (auto& req : local_batch) {
+        if (!running) [[unlikely]] break;
+        off_t src_off;
+        #ifdef REWRITE_DEDUP
+        char tmp_fp[SHA_DIGEST_LENGTH];
+        SHA1((const unsigned char *)req.buffer, SECTOR_SIZE, (unsigned char *)tmp_fp);
+        FP_TYPE fp(tmp_fp, SHA_DIGEST_LENGTH);
+        // check FP exist in rewrite file
+        auto fp_store_iter = rewrite_fp_store.find(fp);
+        if (fp_store_iter == rewrite_fp_store.end()){   // not found
+            rewrite_fp_store[fp] = rewrite_file_size;
+            pwrite(rewrite_fh, req.buffer, SECTOR_SIZE, rewrite_file_size);
+            real_rewrite_size += SECTOR_SIZE;
+            src_off = rewrite_file_size;
+            rewrite_file_size += SECTOR_SIZE;
+        }
+        else src_off = fp_store_iter->second;
+        #else
+        pwrite(rewrite_fh, req.buffer, SECTOR_SIZE, rewrite_file_size);
+        real_rewrite_size += SECTOR_SIZE;
+        src_off = rewrite_file_size;
+        rewrite_file_size += SECTOR_SIZE;
+        #endif
+        rewrite_map[req.iNum].insert({req.logical_offset, src_off});
+    }
+    
+    std::vector<std::thread> threads;
+    for (auto& [iNum, chunks] : rewrite_map){
+        if (!running) [[unlikely]] break;
+        max_inline_rewrite_chunks = std::max(max_inline_rewrite_chunks, (uint64_t)chunks.size());
+        total_rewrite_size += chunks.size() * SECTOR_SIZE;
+        threads.emplace_back([&, iNum=iNum]{ 
+            rewrite_handler(iNum, chunks, rewrite_file_iNum);
+        });
+    }
+    for (auto& t : threads)
+        t.join();
 }

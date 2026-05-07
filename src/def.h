@@ -53,13 +53,18 @@
 #define GROUP_IDX_TYPE uint32_t
 
 // freq tracker
-#define DECAY_FACTOR 0.9
-#define TIME_INTERVAL 60000000
+#define DECAY_FACTOR 0.95
+#define TIME_INTERVAL 60000000      // 1 minutes
+// #define RECORD_PAGE_SCORE
+#define RECORD_PAGE_SCORE_PATH "/home/johnnychang/result/fuse.pgscore"
+
 
 // inline rewrite threshold
-#define PAGE_READ_LATENCY 50000
+#define PAGE_READ_LATENCY 58000
 #define PAGE_WRITE_LATENCY 561000
 #define INLINE_REWRITE_THRESHOLD (PAGE_WRITE_LATENCY / PAGE_READ_LATENCY)
+#define INLINE_REWRITE_QUEUE_MAX 262144
+#define INLINE_REWRITE_INTERVAL 5       // seconds to wait between each rewrite pass
 
 // struct define
 struct chunk_addr{
@@ -73,6 +78,7 @@ struct hash_store_entry{
 };
 struct mapping_table_entry{
     std::vector<GROUP_IDX_TYPE> group_idx;              // the group index of each "BLOCK"
+    std::vector<bool> has_rewrite;
     std::vector<off_t> group_logical_offset;            // the logical start byte of every group in this file
     std::vector<off_t> group_virtual_offset;            // the virtual start byte of every group in this file
     std::vector<chunk_addr*> group_pos;                 // The real position of every Group
@@ -80,7 +86,6 @@ struct mapping_table_entry{
     size_t logical_size = 0;                            // the file size host will see(before dedup)
     size_t virtual_size = 0;                            // how many chunk have been reflink into virtual file(in bytes)
     size_t real_size = 0;                               // how many size has been used in real file
-    uint32_t version = 0;                               // bumped on inline rewrite to invalidate stale fh
 };
 struct buffer_entry{
     off_t start_byte;       // which bytes to start
@@ -100,7 +105,6 @@ struct file_handler_data{
     int fh;                     // the file descriptor of the file
     int csfh;                   // the file descriptor of chunk store
     char mode;                  // the mode of open('r' | 'w')
-    uint32_t version = 0;       // mapping table version at open time
     buffer_entry write_buf;     // the buffer use for write operation.
     #ifdef CHUNK_CACHE_SIZE
     uint8_t chunk_count = 0; // how many chunks in chunk store

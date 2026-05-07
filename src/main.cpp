@@ -41,6 +41,7 @@ static void dedupfs_leave(void *param){
     PRINT_MESSAGE("Total rewrite size: " << total_rewrite_size);
     PRINT_MESSAGE("Real rewrite size(GB): " << (float)real_rewrite_size / 1073741824 << "GB");
     PRINT_MESSAGE("Real rewrite size: " << real_rewrite_size);
+    PRINT_MESSAGE("Max inline rewrite chunks (single handler call): " << max_inline_rewrite_chunks);
     #ifdef RECORD_LATENCY
     // output bandwidth of each page to file
     std::ofstream lat_output(RECORD_LATENCY_PATH);
@@ -71,6 +72,10 @@ static void dedupfs_leave(void *param){
             frag_output << read_size << std::endl;
         }
     }
+    #endif
+    #ifdef RECORD_PAGE_SCORE
+    freq_tracker.dump_scores(RECORD_PAGE_SCORE_PATH);
+    PRINT_MESSAGE("page score dumped to " RECORD_PAGE_SCORE_PATH);
     #endif
     #ifdef RECORD_READ_REQ
     std::ofstream read_req_output(RECORD_READ_REQ_PATH);
