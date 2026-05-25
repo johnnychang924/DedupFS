@@ -359,7 +359,7 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
         for (off_t LPA = offset / SECTOR_SIZE; LPA < (offset + (off_t)size + SECTOR_SIZE - 1) / SECTOR_SIZE; LPA++)
             min_score = std::min(min_score, freq_tracker.read((uint64_t)iNum << 32 | LPA));
         float extra_read_pages = (float)(io_size - size) / SECTOR_SIZE;
-        if (min_score * extra_read_pages > INLINE_REWRITE_THRESHOLD) {
+        if (min_score * extra_read_pages * REWRITE_THREADHOLD_FACTOR > INLINE_REWRITE_THRESHOLD) {
             // phase 1: build rewrite requests under mapping table shared lock only
             std::vector<rewrite_req_struct> pending;
             {

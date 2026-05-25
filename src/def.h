@@ -14,6 +14,9 @@
 // #define INLINE_REWRITE
 // #define REWRITE_DEDUP
 #define REWRITE_FILE_PATH "/rewrite"
+#if !defined(REWRITE_THREADHOLD_FACTOR)
+#define REWRITE_THREADHOLD_FACTOR 1
+#endif
 
 #ifndef ONESHOT_REWRITE_COUNT
 #define ONESHOT_REWRITE_COUNT 1048576 // default 4GB page
