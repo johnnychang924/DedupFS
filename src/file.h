@@ -366,6 +366,7 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     read_req_list[read_req_count].ssd_size = io_size;
     read_req_list[read_req_count].real_io_size = real_io_size;
+    read_req_count += 1;
     //read_req_list[read_req_count++].end_time = ts;
     if(read_req_count > MAX_READ_REQ_RECORD) read_req_count = MAX_READ_REQ_RECORD - 1;
     DEBUG_MESSAGE("end time: sec->" << ts.tv_sec << " nsec->" << ts.tv_nsec);
