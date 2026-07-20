@@ -122,10 +122,10 @@ struct each_page_read_bandwidth{
 #ifdef RECORD_READ_REQ
 #define MAX_READ_REQ_RECORD 26214400
 struct read_req{
-    struct timespec start_time;
-    struct timespec end_time;
-    INUM_TYPE iNum;
-    bool ref_other;
+    //struct timespec start_time;
+    //struct timespec end_time;
+    //INUM_TYPE iNum;
+    //bool ref_other;
     off_t offset;
     size_t size;
     size_t ssd_size;

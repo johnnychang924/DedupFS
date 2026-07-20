@@ -276,8 +276,8 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     #ifdef RECORD_READ_REQ
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-    read_req_list[read_req_count].start_time = ts;
-    read_req_list[read_req_count].iNum = iNum;
+    //read_req_list[read_req_count].start_time = ts;
+    //read_req_list[read_req_count].iNum = iNum;
     read_req_list[read_req_count].offset = offset;
     read_req_list[read_req_count].size = size;
     DEBUG_MESSAGE("start time: sec->" << ts.tv_sec << " nsec->" << ts.tv_nsec);
@@ -344,10 +344,10 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
             lfu.touch((uint64_t)iNum << 32 | LPA);
     #endif
     #ifdef RECORD_READ_REQ
-    read_req_list[read_req_count].ref_other = false;
-    for (GROUP_IDX_TYPE i = start_group_idx; i <= cur_group_idx; i++){
-        read_req_list[read_req_count].ref_other |= mapping_table[iNum].group_pos[i]->iNum != iNum;
-    }
+    //read_req_list[read_req_count].ref_other = false;
+    //for (GROUP_IDX_TYPE i = start_group_idx; i <= cur_group_idx; i++){
+    //    read_req_list[read_req_count].ref_other |= mapping_table[iNum].group_pos[i]->iNum != iNum;
+    //}
     #endif
     #ifdef RECORD_LATENCY
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -366,7 +366,7 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     read_req_list[read_req_count].ssd_size = io_size;
     read_req_list[read_req_count].real_io_size = real_io_size;
-    read_req_list[read_req_count++].end_time = ts;
+    //read_req_list[read_req_count++].end_time = ts;
     if(read_req_count > MAX_READ_REQ_RECORD) read_req_count = MAX_READ_REQ_RECORD - 1;
     DEBUG_MESSAGE("end time: sec->" << ts.tv_sec << " nsec->" << ts.tv_nsec);
     #endif

@@ -80,10 +80,10 @@ static void dedupfs_leave(void *param){
     #ifdef RECORD_READ_REQ
     std::ofstream read_req_output(RECORD_READ_REQ_PATH);
     for(uint64_t i = 0; i < read_req_count; i++){
-        read_req_output << read_req_list[i].start_time.tv_sec << " " << read_req_list[i].start_time.tv_nsec << " ";
-        read_req_output << read_req_list[i].end_time.tv_sec << " "  << read_req_list[i].end_time.tv_nsec << " ";
-        read_req_output << read_req_list[i].iNum << " ";
-        read_req_output << (read_req_list[i].ref_other ? "yes" : "no") << " ";
+        //read_req_output << read_req_list[i].start_time.tv_sec << " " << read_req_list[i].start_time.tv_nsec << " ";
+        //read_req_output << read_req_list[i].end_time.tv_sec << " "  << read_req_list[i].end_time.tv_nsec << " ";
+        //read_req_output << read_req_list[i].iNum << " ";
+        //read_req_output << (read_req_list[i].ref_other ? "yes" : "no") << " ";
         read_req_output << read_req_list[i].offset << " ";
         read_req_output << read_req_list[i].size << " ";
         read_req_output << read_req_list[i].ssd_size << " ";
