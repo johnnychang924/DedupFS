@@ -42,6 +42,12 @@ static void dedupfs_leave(void *param){
     PRINT_MESSAGE("Real rewrite size(GB): " << (float)real_rewrite_size / 1073741824 << "GB");
     PRINT_MESSAGE("Real rewrite size: " << real_rewrite_size);
     PRINT_MESSAGE("Max inline rewrite chunks (single handler call): " << max_inline_rewrite_chunks);
+    PRINT_MESSAGE("remap fragmentation: " << (float)remap_pread_count / remap_req_count);
+    uint64_t total_read_req = read_req_align + read_req_misalign + read_req_frag;
+    PRINT_MESSAGE("Total read req#: " << total_read_req);
+    PRINT_MESSAGE("Aligned read req#: " << read_req_align);
+    PRINT_MESSAGE("Misaligned read req#: " << read_req_misalign);
+    PRINT_MESSAGE("Frag read req#: " << read_req_frag);
     #ifdef RECORD_LATENCY
     // output bandwidth of each page to file
     std::ofstream lat_output(RECORD_LATENCY_PATH);
@@ -107,6 +113,7 @@ static struct fuse_operations dedupfs_oper = {
     .open           = dedupfs_open,
     .read           = dedupfs_read,
     .write          = dedupfs_write,
+    .flush          = dedupfs_flush,
     .release        = dedupfs_release,
     .opendir        = dedupfs_opendir,
     .readdir        = dedupfs_readdir,
@@ -144,7 +151,6 @@ int main(int argc, char *argv[]) {
         }
         std::filesystem::remove_all(entry.path());
     }
-    // init CDCFS data structure
     PRINT_MESSAGE("----------------------------------------entering CDCFS !!----------------------------------------");
     #ifdef PENDING
         PRINT_MESSAGE("enable pending!!");
@@ -167,6 +173,7 @@ int main(int argc, char *argv[]) {
     #ifdef RECORD_READ_REQ
         PRINT_MESSAGE("enable record read request!!");
     #endif
+    // init CDCFS data structure
     for (INUM_TYPE iNum = 0; iNum < MAX_INODE_NUM - 1; ++iNum)
         free_iNum.insert(iNum);
     for(FILE_HANDLER_INDEX_TYPE file_handler = 0; file_handler < MAX_FILE_HANDLER - 1; ++file_handler)

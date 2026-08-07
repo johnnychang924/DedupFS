@@ -1,6 +1,7 @@
 #include <iostream>
-#include <vector>
+#include <limits.h>
 #include <cstdint>
+#include <vector>
 
 #ifndef DEF_H
 #define DEF_H
@@ -62,13 +63,14 @@
 // #define RECORD_PAGE_SCORE
 #define RECORD_PAGE_SCORE_PATH "/home/johnnychang/result/fuse.pgscore"
 
-
-// inline rewrite threshold
-#define PAGE_READ_LATENCY 58000
-#define PAGE_WRITE_LATENCY 561000
+// inline rewrite
+#define PAGE_READ_LATENCY 35760     // samsung 970 pro
+#define PAGE_WRITE_LATENCY 185000   // samsung 970 pro
 #define INLINE_REWRITE_THRESHOLD (PAGE_WRITE_LATENCY / PAGE_READ_LATENCY)
 #define INLINE_REWRITE_QUEUE_MAX 262144
-#define INLINE_REWRITE_INTERVAL 5       // seconds to wait between each rewrite pass
+#define ONESHOT_REWRITE_SIZE 131072     // 128KiB
+
+#define OFF_T_MAX ((off_t)~((off_t)1 << (sizeof(off_t) * CHAR_BIT - 1)))
 
 // struct define
 struct chunk_addr{
@@ -144,7 +146,9 @@ struct read_req{
 #else
 #define DEBUG_MESSAGE(msg)
 #endif
+
 #define PRINT_MESSAGE(msg) std::cout << msg << std::endl
+
 #define PRINT_WARNING(msg) std::cerr << msg << std::endl
 
 #endif /* DEF_H */

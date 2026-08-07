@@ -46,7 +46,8 @@ extern inline int build_virtual_file(mapping_table_entry& entry, int fh);
 extern inline INUM_TYPE get_inum(PATH_TYPE path_str);
 
 bool running = true;
-int rewrite_fh;
+int rewrite_write_fh;
+int rewrite_read_fh;
 
 /*
 * rewrite the offset in a single file(thread safe)
@@ -169,14 +170,62 @@ std::condition_variable_any inline_rewrite_cv;
 std::shared_mutex rewrite_queue_mutex;
 std::deque<rewrite_req_struct> rewrite_queue;
 
+// Compute the sector-aligned byte range [io_off, io_off+io_size) inside the virtual
+// file that the logical range [offset, offset+size) maps to. This mirrors the range
+// math in internal_read: a logical range may straddle several groups that are not
+// contiguous in the virtual file (build_virtual_file sector-aligns each group), so the
+// covered virtual range can exceed `size`. Acquires mapping_table_mutex[iNum] itself,
+// so the caller must NOT already hold it. Returns false on failure.
+static inline bool logical_to_virtual_offset(INUM_TYPE iNum, off_t offset, size_t size, off_t &io_off, off_t &io_size){
+    std::shared_lock<std::shared_mutex> read_lock(mapping_table_mutex[iNum]);
+    // find first block group index
+    GROUP_IDX_TYPE start_group_idx = mapping_table[iNum].group_idx[offset / CHUNK_SIZE];
+    while (true) {
+        off_t cur_group_offset = mapping_table[iNum].group_logical_offset[start_group_idx];
+        if (cur_group_offset > offset)
+            start_group_idx--;
+        else if(cur_group_offset + (off_t)mapping_table[iNum].group_pos[start_group_idx]->length <= offset)
+            start_group_idx++;
+        else break;
+        if (start_group_idx < 0 || start_group_idx >= mapping_table[iNum].group_pos.size()) return false;   // It should not happen
+    }
+    // find need to read range
+    off_t end_off = offset + size;
+    off_t front_gap = offset - mapping_table[iNum].group_logical_offset[start_group_idx];
+    io_off = (mapping_table[iNum].group_virtual_offset[start_group_idx] + front_gap) / SECTOR_SIZE * SECTOR_SIZE;
+    GROUP_IDX_TYPE cur_group_idx = start_group_idx;
+    while(cur_group_idx < mapping_table[iNum].group_logical_offset.size() &&
+                mapping_table[iNum].group_logical_offset[cur_group_idx] < end_off)
+        cur_group_idx++;
+    cur_group_idx -= 1;
+    off_t end_gap = mapping_table[iNum].group_logical_offset[cur_group_idx] + mapping_table[iNum].group_pos[cur_group_idx]->length - end_off;
+    if (end_gap < 0)
+        end_gap = 0;
+    if (cur_group_idx > mapping_table[iNum].completed_link){
+        PRINT_WARNING("[warning] trying to read unreferenced group, group_idx: " << start_group_idx);
+        return false;
+    }
+    io_size = mapping_table[iNum].group_virtual_offset[cur_group_idx] + (off_t)mapping_table[iNum].group_pos[cur_group_idx]->length - end_gap - io_off;
+    io_size = (io_size + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE;  // allign with page
+    return true;
+}
+
+alignas(4096) char rewrite_buffer[ONESHOT_REWRITE_SIZE];
+
 //remap rewrite
 void remap_rewrite_worker(){
-    rewrite_fh = open(BACKEND CHUNK_STORE REWRITE_FILE_PATH, O_RDWR | O_CREAT, 0666);
-
-    if (rewrite_fh == -1){
-        PRINT_WARNING("Critical Error: Can not open rewrite file handler in inline rewrite worker");
+    rewrite_write_fh = open(BACKEND CHUNK_STORE REWRITE_FILE_PATH, O_RDWR | O_CREAT | O_DIRECT, 0666);
+    rewrite_read_fh = open(BACKEND CHUNK_STORE REWRITE_FILE_PATH, O_RDONLY | O_DIRECT, 0666);
+    if (rewrite_write_fh == -1){
+        PRINT_WARNING("Critical Error: Can not open rewrite write file handler in inline rewrite worker");
         return;
     }
+    if (rewrite_read_fh == -1){
+        PRINT_WARNING("Critical Error: Can not open rewrite read file handler in inline rewrite worker");
+        return;
+    }
+    int result = posix_fadvise(rewrite_read_fh, 0, 0, POSIX_FADV_RANDOM);
+    if (result != 0) PRINT_WARNING("Can not set POSIX_FADV_RANDOM");
     while (running){
         std::deque<rewrite_req_struct> local_batch;
         {
@@ -190,7 +239,7 @@ void remap_rewrite_worker(){
         // char* points into local_batch's stable storage; deque iterators/references remain
         // valid as long as we don't push/pop on local_batch itself.
         std::map<INUM_TYPE, std::set<std::pair<off_t, off_t>, RewriteChunkCmp>> rewrite_map;
-        for (auto& req : local_batch) {
+        /*for (auto& req : local_batch) {
             if (!running) [[unlikely]] break;
             off_t src_off;
             #ifdef REWRITE_DEDUP
@@ -208,32 +257,88 @@ void remap_rewrite_worker(){
             }
             else src_off = fp_store_iter->second;
             #else
-            pwrite(rewrite_fh, req.buffer, SECTOR_SIZE, rewrite_file_size);
+            pwrite(rewrite_write_fh, req.buffer, SECTOR_SIZE, rewrite_file_size);
             real_rewrite_size += SECTOR_SIZE;
             src_off = rewrite_file_size;
             rewrite_file_size += SECTOR_SIZE;
             #endif
             rewrite_map[req.iNum].insert({req.logical_offset, src_off});
         }
+        */
+        int rewrite_buffer_size = 0;
+        off_t rewrite_file_cursor = rewrite_file_size;
+        for (auto& req : local_batch){
+            if (!running) [[unlikely]] break;
+
+            // flash buffer
+            if (rewrite_buffer_size == ONESHOT_REWRITE_SIZE) {
+                int ret = pwrite(rewrite_write_fh, rewrite_buffer, ONESHOT_REWRITE_SIZE, rewrite_file_size);
+                if (ret != ONESHOT_REWRITE_SIZE) PRINT_WARNING("Can not flush rewrite buffer!!!");
+                rewrite_buffer_size = 0;
+                real_rewrite_size += ONESHOT_REWRITE_SIZE;
+                rewrite_file_size += ONESHOT_REWRITE_SIZE;
+            }
+
+            // fill in buffer
+            memcpy(rewrite_buffer + rewrite_buffer_size, req.buffer, SECTOR_SIZE);
+            rewrite_buffer_size += SECTOR_SIZE;
+            if (rewrite_buffer_size > ONESHOT_REWRITE_SIZE) PRINT_WARNING("ERROR: rewrite buffer overflow");
+
+            rewrite_map[req.iNum].insert({req.logical_offset, rewrite_file_cursor});
+            rewrite_file_cursor += SECTOR_SIZE;
+        }
+        if (rewrite_buffer_size != 0){
+            int ret = pwrite(rewrite_write_fh, rewrite_buffer, rewrite_buffer_size, rewrite_file_size);
+            if (ret != rewrite_buffer_size) PRINT_WARNING("Can not flush rewrite buffer!!!");
+            real_rewrite_size += rewrite_buffer_size;
+            rewrite_file_size += rewrite_buffer_size;
+        }
+        int result = posix_fadvise(rewrite_read_fh, 0, 0, POSIX_FADV_RANDOM);        // remind kernel that this file is random I/O
+        if (result != 0) PRINT_WARNING("Can not set POSIX_FADV_RANDOM");
         for (auto& [iNum, chunks] : rewrite_map){
             if (!running) [[unlikely]] break;
             max_inline_rewrite_chunks = std::max(max_inline_rewrite_chunks, (uint64_t)chunks.size());
             total_rewrite_size += chunks.size() * SECTOR_SIZE;
-            std::unique_lock<std::shared_mutex> write_lock(mapping_table_remap_mutex[iNum]);
-            for (auto &[logical_offset, src_off]: chunks){
-                mapping_table[iNum].remap[logical_offset] = src_off;
+            {
+                std::unique_lock<std::shared_mutex> write_lock(mapping_table_remap_mutex[iNum]);
+                for (auto &[logical_offset, src_off]: chunks){
+                    mapping_table[iNum].remap[logical_offset] = src_off;
+                }
             }
+            // These pages are now served from the rewrite file, so the copies still
+            // cached in the (old) virtual file are redundant. Drop them from the page
+            // cache to avoid keeping two copies of the same data in memory.
+            // (logical_to_virtual_offset takes mapping_table_mutex[iNum] internally,
+            //  so do NOT hold it here.)
+            //int read_fh = virtual_file_read_fh[iNum];
+            //if (read_fh > 0){
+            //    for (auto &[logical_offset, src_off]: chunks){
+            //        off_t io_off, io_size;
+            //        if (!logical_to_virtual_offset(iNum, logical_offset, SECTOR_SIZE, io_off, io_size)) {
+            //            PRINT_WARNING("Warning: Can not find out don't need area");
+            //            continue;
+            //        }
+            //        int ret = posix_fadvise(read_fh, io_off, io_size, POSIX_FADV_DONTNEED);
+            //        if (ret != 0) PRINT_WARNING("posix_fadvise failed");
+            //    }
+            //}
+            //else PRINT_WARNING("Warning: Can not set POSIX_FADV_DONTNEED, lack of fh");
         }
     }
 }
 
 // inline rewrite worker
 void inline_rewrite_worker(){
-    rewrite_fh = open(BACKEND CHUNK_STORE REWRITE_FILE_PATH, O_RDWR | O_CREAT, 0666);
+    rewrite_write_fh = open(BACKEND CHUNK_STORE REWRITE_FILE_PATH, O_RDWR | O_CREAT, 0666);
+    rewrite_read_fh = open(BACKEND CHUNK_STORE REWRITE_FILE_PATH, O_RDONLY | O_DIRECT, 0666);
     INUM_TYPE rewrite_file_iNum = get_inum(REWRITE_FILE_PATH);
 
-    if (rewrite_fh == -1){
-        PRINT_WARNING("Critical Error: Can not open rewrite file handler in inline rewrite worker");
+    if (rewrite_write_fh == -1){
+        PRINT_WARNING("Critical Error: Can not open rewrite write file handler in inline rewrite worker");
+        return;
+    }
+    if (rewrite_read_fh == -1){
+        PRINT_WARNING("Critical Error: Can not open rewrite read file handler in inline rewrite worker");
         return;
     }
     while (running){
@@ -267,7 +372,7 @@ void inline_rewrite_worker(){
             }
             else src_off = fp_store_iter->second;
             #else
-            pwrite(rewrite_fh, req.buffer, SECTOR_SIZE, rewrite_file_size);
+            pwrite(rewrite_write_fh, req.buffer, SECTOR_SIZE, rewrite_file_size);
             real_rewrite_size += SECTOR_SIZE;
             src_off = rewrite_file_size;
             rewrite_file_size += SECTOR_SIZE;
@@ -284,7 +389,7 @@ void inline_rewrite_worker(){
                 rewrite_handler(iNum, chunks, rewrite_file_iNum);
             });
         }
-        sleep(INLINE_REWRITE_INTERVAL);
+        sleep(5);
         for (auto& t : threads)
             t.join();
     }

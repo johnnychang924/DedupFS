@@ -38,6 +38,11 @@ uint64_t real_write_size = 0;      // total size of writed file in this file sys
 uint64_t total_pending_size = 0;   // total size of pending disk
 uint64_t host_read_size = 0;
 uint64_t fuse_read_size = 0;
+uint64_t remap_pread_count = 0;
+uint64_t remap_req_count = 0;
+uint64_t read_req_align = 0;
+uint64_t read_req_misalign = 0;
+uint64_t read_req_frag = 0;
 // lock
 std::shared_mutex create_file_mutex;    // the lock for create new file
 std::shared_mutex fp_store_mutex;       // the lock for access fp_store
@@ -172,8 +177,11 @@ static int dedupfs_create(const char *path, mode_t mode, struct fuse_file_info *
     // init global read fh for this inode (same inode survives build_virtual_file)
     INUM_TYPE iNum = file_handler[fi->fh].iNum;
     int old_read_fh = virtual_file_read_fh[iNum];
-    virtual_file_read_fh[iNum] = open(full_path, O_RDONLY);
+    virtual_file_read_fh[iNum] = open(full_path, O_RDONLY | O_DIRECT);
+    int result = posix_fadvise(virtual_file_read_fh[iNum], 0, 0, POSIX_FADV_RANDOM);
+    if (result != 0) PRINT_WARNING("Can not set POSIX_FADV_RANDOM");
     if (old_read_fh > 0) close(old_read_fh);
+    fi->direct_io = 1;
     return 0;
 }
 
@@ -184,10 +192,10 @@ static int dedupfs_open(const char *path, struct fuse_file_info *fi) {
     char chunk_store_path[1024];
     snprintf(full_path, sizeof(full_path), "%s%s", BACKEND, path);
     snprintf(chunk_store_path, sizeof(chunk_store_path), "%s%s%s", BACKEND, CHUNK_STORE, path);
-    real_file_handler = open(full_path, fi->flags);
+    real_file_handler = open(full_path, fi->flags | O_DIRECT);
     if (real_file_handler == -1) return -errno;
     if (fi->flags & (O_WRONLY | O_RDWR)) {      // need to write
-        chunk_store_file_handler = open(chunk_store_path, fi->flags);
+        chunk_store_file_handler = open(chunk_store_path, fi->flags | O_DIRECT);
         if (chunk_store_file_handler == -1) return -errno;
     }
     else chunk_store_file_handler = -1;
@@ -196,6 +204,7 @@ static int dedupfs_open(const char *path, struct fuse_file_info *fi) {
     char mode = fi->flags & (O_WRONLY | O_RDWR) ? 'w' : 'r';
     DEBUG_MESSAGE("mode: " << mode);
     init_file_handler(path, fi->fh, real_file_handler, chunk_store_file_handler, mode);
+    fi->direct_io = 1;
     return 0;
 }
 // for dedupfs internal read
@@ -220,27 +229,54 @@ inline int internal_read(INUM_TYPE iNum, int fh, char *buf, size_t size, off_t o
         PRINT_WARNING("[warning] trying to read unreferenced group, group_idx: " << start_group_idx);
         return 0;
     }
-    off_t io_off = (mapping_table[iNum].group_virtual_offset[start_group_idx] + front_gap) / SECTOR_SIZE * SECTOR_SIZE;
+    // off_t io_off = (mapping_table[iNum].group_virtual_offset[start_group_idx] + front_gap) / SECTOR_SIZE * SECTOR_SIZE;
     // just for validate
-    real_io_size = mapping_table[iNum].group_virtual_offset[start_group_idx] + front_gap;
+    // real_io_size = mapping_table[iNum].group_virtual_offset[start_group_idx] + front_gap;
     GROUP_IDX_TYPE cur_group_idx = start_group_idx;
     while(cur_group_idx < mapping_table[iNum].group_logical_offset.size() && 
                 mapping_table[iNum].group_logical_offset[cur_group_idx] < end_off)
         cur_group_idx++;
     cur_group_idx -= 1;
-    off_t end_gap = mapping_table[iNum].group_logical_offset[cur_group_idx] + mapping_table[iNum].group_pos[cur_group_idx]->length - end_off;
-    if (end_gap < 0)
-        end_gap = 0;
     if (cur_group_idx > mapping_table[iNum].completed_link){
         PRINT_WARNING("[warning] trying to read unreferenced group, group_idx: " << start_group_idx);
         return 0;
     }
-    io_size = mapping_table[iNum].group_virtual_offset[cur_group_idx] + (off_t)mapping_table[iNum].group_pos[cur_group_idx]->length - end_gap - io_off;
+
+    off_t end_gap = mapping_table[iNum].group_logical_offset[cur_group_idx] + mapping_table[iNum].group_pos[cur_group_idx]->length - end_off;
+    if (end_gap < 0) end_gap = 0;   // end_off might bigger than logical file size
+    // find smallest need to read area
+    off_t io_start = OFF_T_MAX, io_end = 0;
+    for (GROUP_IDX_TYPE i = start_group_idx; i <= cur_group_idx; i++){
+        off_t group_start = mapping_table[iNum].group_virtual_offset[i];
+        off_t group_end = group_start + mapping_table[iNum].group_pos[cur_group_idx]->length;
+        if (i == start_group_idx) group_start += front_gap;
+        if (i == cur_group_idx) group_end -= end_gap;
+        io_start = std::min(io_start, group_start);
+        io_end = std::max(io_end, group_end);
+    }
+    real_io_size = io_end - io_start;
+    if (io_end < io_start) [[unlikely]] PRINT_WARNING("io_end < io_start" << io_end << ", " << io_start);
+    off_t io_off = io_start / SECTOR_SIZE * SECTOR_SIZE;
+    io_size = (io_end + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE - io_off;
+
+    //io_size = mapping_table[iNum].group_virtual_offset[cur_group_idx] + (off_t)mapping_table[iNum].group_pos[cur_group_idx]->length - end_gap - io_off;
+    //io_size = (io_size + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE;  // allign with page
+
     // just for validate
-    real_io_size = mapping_table[iNum].group_virtual_offset[cur_group_idx] + (off_t)mapping_table[iNum].group_pos[cur_group_idx]->length - end_gap - real_io_size;
-    io_size = (io_size + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE;  // allign with page
+    // real_io_size = mapping_table[iNum].group_virtual_offset[cur_group_idx] + (off_t)mapping_table[iNum].group_pos[cur_group_idx]->length - end_gap - real_io_size;
+    // PRINT_WARNING("real_io_size: " << real_io_size << " io_start: " << io_start << " io_end: " << io_end);
+    
     // read into temp buffer
-    char tmp_buf[io_size];
+    // char tmp_buf[io_size];
+    char *tmp_buf;
+    if (posix_memalign((void**)&tmp_buf, 4096, io_size) != 0){
+        PRINT_WARNING("posix_memalign failed!!!!");
+        return -1;
+    }
+    //auto tmp_buf_chunk = std::unique_ptr<char, decltype(&free)>(
+    //    (char *)aligned_alloc(SECTOR_SIZE, io_size), free);
+    //if (!tmp_buf_chunk) return -ENOMEM;
+    //char *tmp_buf = tmp_buf_chunk.get();
     DEBUG_MESSAGE("  start reading offset->" << io_off << " size->" << io_size);
     int res = pread(virtual_file_read_fh[iNum], tmp_buf, io_size, io_off);
     if ((size_t)res != io_size){
@@ -250,11 +286,12 @@ inline int internal_read(INUM_TYPE iNum, int fh, char *buf, size_t size, off_t o
     int less = size;
     char *cur_buf_ptr = buf;
     cur_group_idx = start_group_idx;
-    front_gap = offset - mapping_table[iNum].group_logical_offset[cur_group_idx];
+    front_gap = offset - mapping_table[iNum].group_logical_offset[start_group_idx];
     DEBUG_MESSAGE("  filling return buffer");
     while(less > 0){
         size_t cp_size = std::min(mapping_table[iNum].group_pos[cur_group_idx]->length - (size_t)front_gap, (size_t)less);
         off_t tmp_buf_off = mapping_table[iNum].group_virtual_offset[cur_group_idx] - io_off + front_gap;
+        // if (tmp_buf_off < 0 || tmp_buf_off + cp_size > io_size) PRINT_WARNING("read outside of buffer " << io_size << ", " << tmp_buf_off << ", " << cp_size);
         DEBUG_MESSAGE("    cur_group->" << cur_group_idx << " front_gap->" << front_gap << " cp_size->" << cp_size << " group_offset->" << mapping_table[iNum].group_virtual_offset[cur_group_idx] << " group_size->" << mapping_table[iNum].group_pos[cur_group_idx]->length << " tmp_buffer_offset->" << tmp_buf_off);
         memcpy(cur_buf_ptr, tmp_buf + tmp_buf_off, cp_size);
         less -= cp_size;
@@ -263,6 +300,7 @@ inline int internal_read(INUM_TYPE iNum, int fh, char *buf, size_t size, off_t o
         cur_group_idx++;
         front_gap = 0;
     }
+    free(tmp_buf);
     return size - std::max(less, 0);
 }
 
@@ -290,6 +328,7 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     size_t io_size = 0;
     int ret;
     #if defined(USING_REMAP) && defined(INLINE_REWRITE)
+    int local_remap_pread_count = 0;
     {
         off_t end = std::min(offset + (off_t)size, (off_t)mapping_table[iNum].logical_size);
         // snapshot in-range remap entries, then release the lock immediately
@@ -321,7 +360,16 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
                 off_t run_logical_end = run_logical_start + (off_t)(run_pages * SECTOR_SIZE);
                 off_t in_run_offset = cur - run_logical_start;
                 size_t copy_size = std::min(run_logical_end, end) - cur;
-                int res = pread(rewrite_fh, buf + (cur - offset), copy_size, run_src_start + in_run_offset);
+                char *tmp_buf;
+                if (posix_memalign((void**)&tmp_buf, 4096, copy_size) != 0){
+                    PRINT_WARNING("posix_memalign failed!!!!");
+                    return -1;
+                }
+                int res = pread(rewrite_read_fh, tmp_buf, copy_size, run_src_start + in_run_offset);
+                if (copy_size % 4096 != 0 || (run_src_start + in_run_offset) % 4096 != 0) [[unlikely]] PRINT_WARNING("Can not use direct I/O");
+                memcpy(buf + (cur - offset), tmp_buf, copy_size);
+                free(tmp_buf);
+                local_remap_pread_count += 1;
                 if ((size_t)res != copy_size) [[unlikely]] {
                     PRINT_WARNING("remap pread failed: read " << res << " expected " << copy_size);
                     return 0;
@@ -345,6 +393,7 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
                 total_read += sub_ret;
                 cur = run_end;
             }
+            if (cur < end)[[unlikely]] PRINT_WARNING("Read didn't complete after one round");
         }
         ret = total_read;
     }
@@ -420,10 +469,24 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
         each_file_read_bandwidth[iNum].count[i] += 1;
     }
     #endif
+    if (real_io_size > io_size) [[unlikely]] PRINT_WARNING("ERROR: io_size > real_io_size" << io_size << ", " << real_io_size);
     // record fs read information
     std::unique_lock<std::shared_mutex> unique_read_record_lock(read_record_mutex);
     host_read_size += std::abs((off_t)std::min(offset + size, mapping_table[iNum].logical_size) - offset);
     fuse_read_size += io_size;
+    if (io_size <= size && real_io_size <= size){
+        read_req_align += 1;
+    }
+    else if (io_size > size && real_io_size <= size){
+        read_req_misalign += 1;
+    }
+    else {
+        read_req_frag += 1;
+    }
+    #if defined(USING_REMAP) && defined(INLINE_REWRITE)
+    remap_pread_count += local_remap_pread_count;
+    if (local_remap_pread_count != 0) remap_req_count += 1;
+    #endif
     unique_read_record_lock.unlock();
     #ifdef RECORD_READ_REQ
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
@@ -682,9 +745,9 @@ inline int build_virtual_file(INUM_TYPE iNum, int fh){
     return build_virtual_file(mapping_table[iNum], fh);
 }
 
-static int dedupfs_release(const char *path, struct fuse_file_info *fi){
+static int dedupfs_flush(const char *path, struct fuse_file_info *fi){
     // write back buffer data
-    DEBUG_MESSAGE("[release]" << path);
+    DEBUG_MESSAGE("[flush]" << path);
     INUM_TYPE iNum = file_handler[fi->fh].iNum;
     int real_file_fh = file_handler[fi->fh].fh;
     buffer_entry *buf = &file_handler[fi->fh].write_buf;
@@ -701,7 +764,7 @@ static int dedupfs_release(const char *path, struct fuse_file_info *fi){
     file_handler[fi->fh].chunk_count = 0;
     #endif
     // pending chunk store
-    char empty_buf[4096];
+    char empty_buf[SECTOR_SIZE];
     int pending_size = SECTOR_SIZE - mapping_table[iNum].real_size % SECTOR_SIZE;
     if (pending_size != SECTOR_SIZE){
         pwrite(file_handler[fi->fh].csfh, empty_buf, pending_size, mapping_table[iNum].real_size);
@@ -709,6 +772,13 @@ static int dedupfs_release(const char *path, struct fuse_file_info *fi){
     }
     // build real file mapping
     build_virtual_file(iNum, real_file_fh);
+    return 0;
+}
+
+static int dedupfs_release(const char *path, struct fuse_file_info *fi){
+    DEBUG_MESSAGE("[release]" << path);
+    int real_file_fh = file_handler[fi->fh].fh;
+    buffer_entry *buf = &file_handler[fi->fh].write_buf;
     // release resource
     if (file_handler[fi->fh].mode == 'w'){
         close(file_handler[fi->fh].csfh);
@@ -719,7 +789,7 @@ static int dedupfs_release(const char *path, struct fuse_file_info *fi){
             delete[] file_handler[fi->fh].chunkstore[i].content;
         #endif
     }
-    DEBUG_MESSAGE("  real file size: " << mapping_table[iNum].real_size << " logical file size: " << mapping_table[iNum].logical_size);
+    // DEBUG_MESSAGE("  real file size: " << mapping_table[iNum].real_size << " logical file size: " << mapping_table[iNum].logical_size);
     close(real_file_fh);
     release_file_handler(fi->fh);
     return 0;

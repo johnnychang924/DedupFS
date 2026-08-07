@@ -1,5 +1,6 @@
 #include <fuse.h>
 #include <dirent.h>
+#include <string.h>
 #include "def.h"
 
 static int dedupfs_opendir(const char *path, struct fuse_file_info *fi) {
