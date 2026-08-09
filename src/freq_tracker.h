@@ -1,28 +1,26 @@
 #include <unordered_map>
 #include <cstdint>
 #include <chrono>
-#include <cmath>
-#include <shared_mutex>
-#ifdef RECORD_PAGE_SCORE
-#include <algorithm>
-#include <fstream>
-#include <vector>
-#endif
+#include <mutex>
 
 #include "def.h"
 
 using TimePoint = std::chrono::high_resolution_clock::time_point;
 using ScoreType = float;
 
+/*
+**  Track the hotness of each "Logical page" of file
+*/
 class FreqTracker{
 public:
     FreqTracker() {}
-    ScoreType read(uint64_t LPA){
-        std::unique_lock<std::shared_mutex> lock(mutex);
-        auto it = score_table.find(LPA);
+    ScoreType read(uint32_t iNum, uint32_t LPA){
+        uint64_t key = ((uint64_t)iNum << 32) | LPA;
+        std::lock_guard<std::mutex> lock(write_lock);
+        auto it = score_table.find(key);
         TimePoint cur_timestamp = std::chrono::high_resolution_clock::now();
         if (it == score_table.end()){
-            score_table[LPA] = {1, cur_timestamp};
+            score_table[key] = {1, cur_timestamp};
             return 1;
         }
         else{
@@ -33,24 +31,12 @@ public:
             return entry.first;
         }
     }
-    void delete_LPA(uint64_t LPA){
-        std::unique_lock<std::shared_mutex> lock(mutex);
-        score_table.erase(LPA);
+    void delete_LPA(uint32_t iNum, uint32_t LPA){
+        uint64_t key = ((uint64_t)iNum << 32) | LPA;
+        std::lock_guard<std::mutex> lock(write_lock);
+        score_table.erase(key);
     }
-    #ifdef RECORD_PAGE_SCORE
-    void dump_scores(const char* path){
-        std::unique_lock<std::shared_mutex> lock(mutex);
-        std::vector<std::pair<uint64_t, ScoreType>> entries;
-        entries.reserve(score_table.size());
-        for (const auto& kv : score_table)
-            entries.push_back({kv.first, kv.second.first});
-        std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b){ return a.second < b.second; });
-        std::ofstream out(path);
-        for (const auto& e : entries)
-            out << e.first << " " << e.second << "\n";
-    }
-    #endif
 private:
     std::unordered_map<uint64_t, std::pair<ScoreType, TimePoint>> score_table;
-    std::shared_mutex mutex;
+    std::mutex write_lock;
 };

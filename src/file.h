@@ -6,156 +6,28 @@
 #include <map>
 #include <openssl/sha.h>
 #include <string>
-#include <set>
 #include <vector>
 #include <algorithm>
 #include <cstring>
 #include <cmath>
 #include <mutex>
 #include <shared_mutex>
-#include "def.h"
-#include "fastcdc.h"
-#include "rewrite.h"
 #include <sys/ioctl.h>
 #include <linux/fs.h>
 #include <time.h>
+
 #include "freq_tracker.h"
+#include "metadata.h"
+#include "rewrite.h"
+#include "def.h"
 
-// iNumber management
-std::set<INUM_TYPE> free_iNum;
-PATH_TYPE iNum_to_path[MAX_INODE_NUM];
-std::unordered_map<PATH_TYPE, INUM_TYPE> path_to_iNum;
-// file handler
-std::set<FILE_HANDLER_INDEX_TYPE> free_file_handler;
-file_handler_data file_handler[MAX_FILE_HANDLER];   // get iNum by file handler (faster than get by file path)
-// fingerprint store
-std::unordered_map<FP_TYPE, hash_store_entry> fp_store;
-// mapping table
-mapping_table_entry mapping_table[MAX_INODE_NUM];
-// file system stat record
-uint64_t total_write_size = 0;     // total size of writed file in this file system
-uint64_t real_write_size = 0;      // total size of writed file in this file system after deduplication
-uint64_t total_pending_size = 0;   // total size of pending disk
-uint64_t host_read_size = 0;
-uint64_t fuse_read_size = 0;
-uint64_t remap_pread_count = 0;
-uint64_t remap_req_count = 0;
-uint64_t read_req_align = 0;
-uint64_t read_req_misalign = 0;
-uint64_t read_req_frag = 0;
-// lock
-std::shared_mutex create_file_mutex;    // the lock for create new file
-std::shared_mutex fp_store_mutex;       // the lock for access fp_store
-std::shared_mutex file_handler_mutex;   // the lock for allocate file handler and free file handler
-std::shared_mutex chunker_mutex;        // the lock for access chunker
-std::shared_mutex write_record_mutex;  // the lock for recording file system status
-std::shared_mutex read_record_mutex;    // the lock for record host/fuse/ssd read size
-std::shared_mutex mapping_table_mutex[MAX_INODE_NUM];           // per-file lock: shared for reads, exclusive for inline rewrite
-std::shared_mutex mapping_table_remap_mutex[MAX_INODE_NUM];     // per-file lock: protect remap
-// fastCDC chunker
-fcdc_ctx cdc, *ctx;
-
-#if defined(INLINE_REWRITE) || defined(REWRITE)
+/*
+**  frequency tracker
+*/
+#if defined(INLINE_REWRITE)
 FreqTracker freq_tracker;
 #endif
 
-#ifdef RECORD_LATENCY
-// record each page's read bandwidth
-each_page_read_bandwidth each_file_read_bandwidth[MAX_INODE_NUM];
-#endif
-
-#ifdef RECORD_READ_REQ
-struct read_req read_req_list[MAX_READ_REQ_RECORD];
-uint64_t read_req_count = 0;
-#endif
-
-inline INUM_TYPE get_inum(PATH_TYPE path_str){
-    std::shared_lock<std::shared_mutex> shared_create_file_lock(create_file_mutex);     // make sure nobody is creating new file at the same time
-    auto it = path_to_iNum.find(path_str);
-    shared_create_file_lock.unlock();
-    if (it != path_to_iNum.end()){
-        return it->second;
-    }
-    else {
-        std::unique_lock<std::shared_mutex> unique_create_file_lock(create_file_mutex); // lock for creating new file
-        if (free_iNum.empty()){
-            PRINT_WARNING("run out of iNum");
-            return -1;
-        }
-        INUM_TYPE new_iNum = *free_iNum.begin();
-        free_iNum.erase(free_iNum.begin());
-        path_to_iNum[path_str] = new_iNum;
-        iNum_to_path[new_iNum] = path_str;
-        return new_iNum;
-    }
-}
-
-inline PATH_TYPE get_path(INUM_TYPE iNum){
-    std::shared_lock<std::shared_mutex> shared_create_file_lock(create_file_mutex);      // make sure nobody is creating new file at the same time
-    return iNum_to_path[iNum];
-}
-
-inline FILE_HANDLER_INDEX_TYPE get_free_file_handler(){
-    std::unique_lock<std::shared_mutex> unique_file_handler_lock(file_handler_mutex);   // lock for allocating new file handler
-    if (free_file_handler.empty()){
-        PRINT_WARNING("dedupfs: run out of file handlers");
-        return -1;
-    }
-    FILE_HANDLER_INDEX_TYPE new_file_handler_index = *free_file_handler.begin();
-    free_file_handler.erase(free_file_handler.begin());
-    return new_file_handler_index;
-}
-
-inline void release_file_handler(FILE_HANDLER_INDEX_TYPE file_handler_index){
-    if (file_handler_index < 0 || file_handler_index >= MAX_FILE_HANDLER) return;
-    std::unique_lock<std::shared_mutex> unique_file_handler_lock(file_handler_mutex);    // lock for freeing file handler
-    free_file_handler.insert(file_handler_index);
-}
-
-inline void init_file_handler(const char *path, FILE_HANDLER_INDEX_TYPE file_handler_index, int real_file_handler, int chunk_store_file_handler, char mode){
-    PATH_TYPE path_str(path);
-    INUM_TYPE iNum = get_inum(path_str);
-    file_handler[file_handler_index] = {
-        .iNum = iNum,
-        .fh = real_file_handler,
-        .csfh = chunk_store_file_handler,
-        .mode = mode,
-    };
-    if (mode == 'w'){
-        file_handler[file_handler_index].write_buf = {
-            .start_byte = (off_t)mapping_table[iNum].logical_size,
-            .byte_cnt = 0,
-            .content = new char[MAX_GROUP_SIZE],
-        };
-        #ifdef CHUNK_CACHE_SIZE
-        file_handler[file_handler_index].chunk_count = 0;
-        for (int i = 0; i < CHUNK_CACHE_SIZE; i++)
-            file_handler[file_handler_index].chunkstore[i].content = new char[MAX_GROUP_SIZE];
-        #endif
-    }
-}
-
-static int dedupfs_getattr(const char *path, struct stat *stbuf) {
-    DEBUG_MESSAGE("[getattr]" << path);
-    if (strcmp(path, CHUNK_STORE) == 0 || strncmp(path, CHUNK_STORE"/", 13) == 0) return -EINVAL;
-    int res;
-    char full_path[1024];
-    PATH_TYPE path_str(path);
-    snprintf(full_path, sizeof(full_path), "%s%s", BACKEND, path);
-    res = lstat(full_path, stbuf);
-    if (res == -1) {
-        return -errno;
-    }
-    std::shared_lock<std::shared_mutex> shared_create_file_lock(create_file_mutex);     // make sure nobody is creating new file at the same time
-    auto it = path_to_iNum.find(path_str);
-    if (it != path_to_iNum.end()){
-        INUM_TYPE iNum = it->second;
-        stbuf->st_size = mapping_table[iNum].logical_size;
-        stbuf->st_blocks = (mapping_table[iNum].logical_size + 511) / 512;
-    }
-    shared_create_file_lock.unlock();
-    return 0;
-}
 
 static int dedupfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
     DEBUG_MESSAGE("[create]" << path);
@@ -171,7 +43,7 @@ static int dedupfs_create(const char *path, mode_t mode, struct fuse_file_info *
     if (real_file_handler == -1) return -errno;
     chunk_store_file_handler = creat(chunk_store_path, mode);
     if (chunk_store_file_handler == -1) return -errno;
-    fi->fh = get_free_file_handler();
+    fi->fh = get_file_handler();
     if (fi->fh == (FILE_HANDLER_INDEX_TYPE)-1) return -errno;
     init_file_handler(path, fi->fh, real_file_handler, chunk_store_file_handler, 'w');
     // init global read fh for this inode (same inode survives build_virtual_file)
@@ -199,7 +71,7 @@ static int dedupfs_open(const char *path, struct fuse_file_info *fi) {
         if (chunk_store_file_handler == -1) return -errno;
     }
     else chunk_store_file_handler = -1;
-    fi->fh = get_free_file_handler();
+    fi->fh = get_file_handler();
     if (fi->fh == -1ULL) return -errno;
     char mode = fi->flags & (O_WRONLY | O_RDWR) ? 'w' : 'r';
     DEBUG_MESSAGE("mode: " << mode);
@@ -306,28 +178,13 @@ inline int internal_read(INUM_TYPE iNum, int fh, char *buf, size_t size, off_t o
 
 static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi){
     DEBUG_MESSAGE("[read]" << path << " offset: " << offset << " size: " << size);
-    #ifdef RECORD_LATENCY
-    auto start_time = std::chrono::high_resolution_clock::now();
-    #endif
     
     INUM_TYPE iNum = file_handler[fi->fh].iNum;
-
-    #ifdef RECORD_READ_REQ
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-    read_req_list[read_req_count].start_time = ts;
-    read_req_list[read_req_count].iNum = iNum;
-    read_req_list[read_req_count].offset = offset;
-    read_req_list[read_req_count].size = size;
-    DEBUG_MESSAGE("start time: sec->" << ts.tv_sec << " nsec->" << ts.tv_nsec);
-    #endif
-
     if ((size_t)offset > mapping_table[iNum].logical_size || size == 0) return 0;
-
     size_t real_io_size = 0;
     size_t io_size = 0;
     int ret;
-    #if defined(USING_REMAP) && defined(INLINE_REWRITE)
+    #if defined(INLINE_REWRITE)
     int local_remap_pread_count = 0;
     {
         off_t end = std::min(offset + (off_t)size, (off_t)mapping_table[iNum].logical_size);
@@ -402,13 +259,14 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     #endif
     if (ret == 0)
         return ret;     // something went wrong, return the process to prevent more system damage
-    #if defined(INLINE_REWRITE) || defined(REWRITE)
+    
+    #if defined(INLINE_REWRITE)
     if (io_size != size && running) {
         float min_score = std::numeric_limits<float>::max();
         for (off_t LPA = offset / SECTOR_SIZE; LPA < (offset + (off_t)size + SECTOR_SIZE - 1) / SECTOR_SIZE; LPA++)
-            min_score = std::min(min_score, freq_tracker.read((uint64_t)iNum << 32 | LPA));
+            min_score = std::min(min_score, freq_tracker.read(iNum, LPA));
         float extra_read_pages = (float)(io_size - size) / SECTOR_SIZE;
-        if (min_score * extra_read_pages * REWRITE_THREADHOLD_FACTOR > INLINE_REWRITE_THRESHOLD) {
+        if (min_score * extra_read_pages > INLINE_REWRITE_THRESHOLD) {
             // phase 1: build rewrite requests under mapping table shared lock only
             std::vector<rewrite_req_struct> pending;
             {
@@ -450,52 +308,21 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
         }
     }
     #endif
-    #ifdef REWRITE
-    if (io_size != size)
-        for (off_t LPA = offset / SECTOR_SIZE; LPA < (offset + (off_t)size + SECTOR_SIZE - 1) / SECTOR_SIZE; LPA++)
-            lfu.touch((uint64_t)iNum << 32 | LPA);
-    #endif
-    #ifdef RECORD_READ_REQ
-    read_req_list[read_req_count].ref_other = false;
-    for (GROUP_IDX_TYPE i = start_group_idx; i <= cur_group_idx; i++){
-        read_req_list[read_req_count].ref_other |= mapping_table[iNum].group_pos[i]->iNum != iNum;
-    }
-    #endif
-    #ifdef RECORD_LATENCY
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> latency_us = end_time - start_time;
-    for (uint32_t i = offset / SECTOR_SIZE; i < std::min((std::size_t)(offset + size + SECTOR_SIZE - 1) / SECTOR_SIZE, each_file_read_bandwidth[iNum].lat.size()); i++){
-        each_file_read_bandwidth[iNum].lat[i] += latency_us.count();
-        each_file_read_bandwidth[iNum].count[i] += 1;
-    }
-    #endif
     if (real_io_size > io_size) [[unlikely]] PRINT_WARNING("ERROR: io_size > real_io_size" << io_size << ", " << real_io_size);
+
     // record fs read information
     std::unique_lock<std::shared_mutex> unique_read_record_lock(read_record_mutex);
     host_read_size += std::abs((off_t)std::min(offset + size, mapping_table[iNum].logical_size) - offset);
     fuse_read_size += io_size;
-    if (io_size <= size && real_io_size <= size){
-        read_req_align += 1;
-    }
-    else if (io_size > size && real_io_size <= size){
-        read_req_misalign += 1;
-    }
-    else {
-        read_req_frag += 1;
-    }
-    #if defined(USING_REMAP) && defined(INLINE_REWRITE)
+    if (io_size <= size && real_io_size <= size) read_req_align += 1;
+    else if (io_size > size && real_io_size <= size) read_req_misalign += 1;
+    else read_req_frag += 1;
+    #if defined(INLINE_REWRITE)
     remap_pread_count += local_remap_pread_count;
     if (local_remap_pread_count != 0) remap_req_count += 1;
     #endif
     unique_read_record_lock.unlock();
-    #ifdef RECORD_READ_REQ
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-    read_req_list[read_req_count].ssd_size = io_size;
-    read_req_list[read_req_count].real_io_size = real_io_size;
-    read_req_list[read_req_count++].end_time = ts;
-    if(read_req_count > MAX_READ_REQ_RECORD) read_req_count = MAX_READ_REQ_RECORD - 1;
-    DEBUG_MESSAGE("end time: sec->" << ts.tv_sec << " nsec->" << ts.tv_nsec);
-    #endif
+
     return ret;
 }
 
@@ -525,7 +352,7 @@ inline int writeback_disk(INUM_TYPE iNum, GROUP_IDX_TYPE group_idx, int fh, char
     #ifdef PENDING
     int pending_size = pending_disk(fh, iNum, mapping_table[iNum].group_logical_offset[group_idx]);
     std::unique_lock<std::shared_mutex> unique_write_record_lock(write_record_mutex);
-    total_pending_size += pending_size;
+    total_padding_size += pending_size;
     unique_write_record_lock.unlock();
     #endif
     DEBUG_MESSAGE("Pending success");
@@ -613,8 +440,8 @@ inline int flush_buffer(buffer_entry *buf, INUM_TYPE iNum, int csfh, FILE_HANDLE
     DEBUG_MESSAGE("  flush buffer: " << iNum << " buf size: " << buf->byte_cnt);
     // chunking
     std::unique_lock<std::shared_mutex> unique_chunker_lock(chunker_mutex);
-    int cut_pos = cut((const uint8_t*)buf->content, MAX_GROUP_SIZE, ctx->mi, ctx->ma, ctx->ns,
-                      ctx->mask_s, ctx->mask_l);
+    int cut_pos = cut((const uint8_t*)buf->content, MAX_GROUP_SIZE, cdc_setting.mi, cdc_setting.ma, cdc_setting.ns,
+                      cdc_setting.mask_s, cdc_setting.mask_l);
     unique_chunker_lock.unlock();
     #if defined(CAFTL) || defined(NODEDUPE)
     cut_pos = CHUNK_SIZE;
@@ -797,16 +624,6 @@ static int dedupfs_release(const char *path, struct fuse_file_info *fi){
 
 static int dedupfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi){
     DEBUG_MESSAGE("[write]" << path << " offset: " << offset << " size: " << size);
-    if (strncmp(path, COMMAND_PATH, sizeof(COMMAND_PATH)) == 0){
-        if (strncmp(buf, "rewrite", 7) == 0){
-            PRINT_MESSAGE("start rewriting!!!");
-            rewrite();
-        }
-        else{
-            PRINT_WARNING("known command:" << buf);
-        }
-        return size;
-    }
     std::unique_lock<std::shared_mutex> unique_write_record_lock(write_record_mutex);
     total_write_size += size;
     unique_write_record_lock.unlock();

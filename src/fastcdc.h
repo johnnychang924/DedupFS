@@ -1,3 +1,8 @@
+/*
+** I copy this implementation from https://github.com/sleepybishop/fastcdc
+** I use cut function directly
+*/
+
 #ifndef FASTCDC_H
 #define FASTCDC_H
 

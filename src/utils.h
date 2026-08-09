@@ -2,6 +2,28 @@
 #include <unistd.h>
 #include "def.h"
 
+static int dedupfs_getattr(const char *path, struct stat *stbuf) {
+    DEBUG_MESSAGE("[getattr]" << path);
+    if (strcmp(path, CHUNK_STORE) == 0 || strncmp(path, CHUNK_STORE"/", 13) == 0) return -EINVAL;
+    int res;
+    char full_path[1024];
+    PATH_TYPE path_str(path);
+    snprintf(full_path, sizeof(full_path), "%s%s", BACKEND, path);
+    res = lstat(full_path, stbuf);
+    if (res == -1) {
+        return -errno;
+    }
+    std::shared_lock<std::shared_mutex> shared_create_file_lock(create_file_mutex);     // make sure nobody is creating new file at the same time
+    auto it = path_to_iNum.find(path_str);
+    if (it != path_to_iNum.end()){
+        INUM_TYPE iNum = it->second;
+        stbuf->st_size = mapping_table[iNum].logical_size;
+        stbuf->st_blocks = (mapping_table[iNum].logical_size + 511) / 512;
+    }
+    shared_create_file_lock.unlock();
+    return 0;
+}
+
 static int dedupfs_utime(const char *path, struct utimbuf *ubuf) {
     DEBUG_MESSAGE("[utime]" << path);
     char full_path[1024];
@@ -41,23 +63,20 @@ static int dedupfs_symlink(const char *oldpath, const char *newpath) {
     return symlink(full_old, full_new);
 }
 
-static int dedupfs_truncate(const char *path, off_t size) {
+/*static int dedupfs_truncate(const char *path, off_t size) {
     // this function will only use on /command file
     int res;
     char full_path[1024];
     snprintf(full_path, sizeof(full_path), "%s%s", BACKEND, path);
     DEBUG_MESSAGE("[truncate]" << path << " size: " << size);
-    if (strncmp(path, COMMAND_PATH, sizeof(COMMAND_PATH)) != 0){
-        PRINT_WARNING("This system is not support truncate.");
-        return -1;
-    }
 
     res = truncate(full_path, size);
     if (res == -1) {
         return -errno;
     }
     return 0;
-}
+}*/
+
 /*
 static int cdcfs_ftruncate(const char *path, off_t size, fuse_file_info *fi) {
     int res;

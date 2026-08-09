@@ -11,95 +11,54 @@
 
 std::thread rewrite_thread;
 
+/*
+**  Called on filesystem exit. 
+*/
 static void dedupfs_leave(void *param){
     uint64_t chunk_count = 0;
     off_t virtual_write_size = 0;
+    uint64_t total_read_req = read_req_align + read_req_misalign + read_req_frag;
+    int gigabyte = pow(2, 30);
     for (const auto& file_pair: path_to_iNum){
         INUM_TYPE iNum = file_pair.second;
         uint64_t file_group_count = mapping_table[iNum].group_pos.size()-1;
         chunk_count += file_group_count;
         virtual_write_size += mapping_table[iNum].virtual_size;
     }
+    PRINT_MESSAGE("\n----------------------------------------leaving CDCFS !!!----------------------------------------");
+    PRINT_MESSAGE("total write size: " << (float)total_write_size / gigabyte << "GB");
+    PRINT_MESSAGE("real write size: " << (float)real_write_size / gigabyte << "GB");
+    PRINT_MESSAGE("total padding size: " << (float)total_padding_size / gigabyte << "GB");
+    PRINT_MESSAGE("virtual write size: " << (float)virtual_write_size / gigabyte << "GB");
+    PRINT_MESSAGE("total dedup rate: " << 100 - (float)(real_write_size + total_padding_size) / total_write_size * 100 << "%");
+    PRINT_MESSAGE("host read size: " << host_read_size);
+    PRINT_MESSAGE("host read size(GB): " << (float)host_read_size / gigabyte << "GB");
+    PRINT_MESSAGE("FUSE read size: " << fuse_read_size);
+    PRINT_MESSAGE("FUSE read size(GB): " << (float)fuse_read_size / gigabyte << "GB");
+    PRINT_MESSAGE("read amplication: " << (float)fuse_read_size / host_read_size * 100 << "%");
+    PRINT_MESSAGE("average chunking size: " << (float)total_write_size / chunk_count);
+    PRINT_MESSAGE("Total rewrite size(GB): " << (float)total_rewrite_size / gigabyte << "GB");
+    PRINT_MESSAGE("Total rewrite size: " << total_rewrite_size);
+    PRINT_MESSAGE("Real rewrite size(GB): " << (float)real_rewrite_size / gigabyte << "GB");
+    PRINT_MESSAGE("Real rewrite size: " << real_rewrite_size);
+    PRINT_MESSAGE("Max inline rewrite chunks (single handler call): " << max_inline_rewrite_chunks);
+    PRINT_MESSAGE("remap fragmentation: " << (float)remap_pread_count / remap_req_count);
+    PRINT_MESSAGE("Total read req#: " << total_read_req);
+    PRINT_MESSAGE("Aligned read req#: " << read_req_align);
+    PRINT_MESSAGE("Misaligned read req#: " << read_req_misalign);
+    PRINT_MESSAGE("Fragmented read req#: " << read_req_frag);
+
+    // stop rewrite thread
     #ifdef INLINE_REWRITE
     running = false;
     inline_rewrite_cv.notify_one();
     rewrite_thread.join();
     #endif
-    PRINT_MESSAGE("\n----------------------------------------leaving CDCFS !!!----------------------------------------");
-    PRINT_MESSAGE("total write size: " << (float)total_write_size / 1073741824 << "GB");
-    PRINT_MESSAGE("real write size: " << (float)real_write_size / 1073741824 << "GB");
-    PRINT_MESSAGE("total pending size: " << (float)total_pending_size / 1073741824 << "GB");
-    PRINT_MESSAGE("virtual write size: " << (float)virtual_write_size / 1073741824 << "GB");
-    PRINT_MESSAGE("total dedup rate: " << 100 - (float)(real_write_size + total_pending_size) / total_write_size * 100 << "%");
-    PRINT_MESSAGE("host read size: " << host_read_size);
-    PRINT_MESSAGE("host read size(GB): " << (float)host_read_size / 1073741824 << "GB");
-    PRINT_MESSAGE("FUSE read size: " << fuse_read_size);
-    PRINT_MESSAGE("FUSE read size(GB): " << (float)fuse_read_size / 1073741824 << "GB");
-    PRINT_MESSAGE("read amplication: " << (float)fuse_read_size / host_read_size * 100 << "%");
-    PRINT_MESSAGE("average chunking size: " << (float)total_write_size / chunk_count);
-    PRINT_MESSAGE("Total rewrite size(GB): " << (float)total_rewrite_size / 1073741824 << "GB");
-    PRINT_MESSAGE("Total rewrite size: " << total_rewrite_size);
-    PRINT_MESSAGE("Real rewrite size(GB): " << (float)real_rewrite_size / 1073741824 << "GB");
-    PRINT_MESSAGE("Real rewrite size: " << real_rewrite_size);
-    PRINT_MESSAGE("Max inline rewrite chunks (single handler call): " << max_inline_rewrite_chunks);
-    PRINT_MESSAGE("remap fragmentation: " << (float)remap_pread_count / remap_req_count);
-    uint64_t total_read_req = read_req_align + read_req_misalign + read_req_frag;
-    PRINT_MESSAGE("Total read req#: " << total_read_req);
-    PRINT_MESSAGE("Aligned read req#: " << read_req_align);
-    PRINT_MESSAGE("Misaligned read req#: " << read_req_misalign);
-    PRINT_MESSAGE("Frag read req#: " << read_req_frag);
-    #ifdef RECORD_LATENCY
-    // output bandwidth of each page to file
-    std::ofstream lat_output(RECORD_LATENCY_PATH);
-    std::ofstream frag_output(RECORD_FRAG_PATH);
-    for (const auto& file_pair: path_to_iNum){
-        lat_output << "file_name: " << file_pair.first << std::endl;
-        lat_output << "page_count: " << each_file_read_bandwidth[file_pair.second].lat.size() << std::endl;
-        // output latency and count
-        for (uint32_t i = 0; i < each_file_read_bandwidth[file_pair.second].lat.size(); i++){
-            lat_output << each_file_read_bandwidth[file_pair.second].lat[i] << " " << each_file_read_bandwidth[file_pair.second].count[i] << std::endl;
-        }
-        // output fragmentation
-        frag_output << "file_name: " << file_pair.first << std::endl;
-        frag_output << "page_count: " << mapping_table[file_pair.second].group_idx.size() << std::endl;
-        for (uint32_t page_num = 0; page_num < mapping_table[file_pair.second].group_idx.size(); page_num++){
-            GROUP_IDX_TYPE start_group_idx = mapping_table[file_pair.second].group_idx[page_num];
-            GROUP_IDX_TYPE cur_group_idx = start_group_idx;
-            size_t start_gap = page_num * SECTOR_SIZE - mapping_table[file_pair.second].group_logical_offset[cur_group_idx];
-            int less = SECTOR_SIZE + start_gap;
-            if (start_gap < 0 || start_gap > mapping_table[file_pair.second].group_pos[cur_group_idx]->length)
-                PRINT_WARNING("Critical Error: Wrong group index, start_gap: " << start_gap);
-            while(less > 0 && cur_group_idx < mapping_table[file_pair.second].group_pos.size()){
-                less -= mapping_table[file_pair.second].group_pos[cur_group_idx++]->length;
-            }
-            off_t group_end_virtual_offset = mapping_table[file_pair.second].group_virtual_offset[cur_group_idx - 1] + mapping_table[file_pair.second].group_pos[cur_group_idx - 1]->length + less;
-            off_t group_start_virtual_offset = mapping_table[file_pair.second].group_virtual_offset[start_group_idx] + start_gap;
-            int read_size = (((group_end_virtual_offset + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE) - group_start_virtual_offset / SECTOR_SIZE * SECTOR_SIZE);
-            frag_output << read_size << std::endl;
-        }
-    }
-    #endif
-    #ifdef RECORD_PAGE_SCORE
-    freq_tracker.dump_scores(RECORD_PAGE_SCORE_PATH);
-    PRINT_MESSAGE("page score dumped to " RECORD_PAGE_SCORE_PATH);
-    #endif
-    #ifdef RECORD_READ_REQ
-    std::ofstream read_req_output(RECORD_READ_REQ_PATH);
-    for(uint64_t i = 0; i < read_req_count; i++){
-        read_req_output << read_req_list[i].start_time.tv_sec << " " << read_req_list[i].start_time.tv_nsec << " ";
-        read_req_output << read_req_list[i].end_time.tv_sec << " "  << read_req_list[i].end_time.tv_nsec << " ";
-        read_req_output << read_req_list[i].iNum << " ";
-        read_req_output << (read_req_list[i].ref_other ? "yes" : "no") << " ";
-        read_req_output << read_req_list[i].offset << " ";
-        read_req_output << read_req_list[i].size << " ";
-        read_req_output << read_req_list[i].ssd_size << " ";
-        read_req_output << read_req_list[i].real_io_size << std::endl;
-    }
-    unsigned long rd_record_used_perc = read_req_count * 10000UL / MAX_READ_REQ_RECORD;
-    PRINT_MESSAGE("Use up to " << rd_record_used_perc / 100 << "." << rd_record_used_perc % 100 << "% read record space");
-    #endif
 }
 
+/*
+**  FUSE opration struct
+*/
 static struct fuse_operations dedupfs_oper = {
     .getattr        = dedupfs_getattr,
     .readlink       = dedupfs_readlink,
@@ -108,7 +67,7 @@ static struct fuse_operations dedupfs_oper = {
     .rmdir          = dedupfs_rmdir,
     .symlink        = dedupfs_symlink,
     .link           = dedupfs_link,
-    .truncate       = dedupfs_truncate,
+    // .truncate       = dedupfs_truncate,
     .utime          = dedupfs_utime,
     .open           = dedupfs_open,
     .read           = dedupfs_read,
@@ -123,14 +82,34 @@ static struct fuse_operations dedupfs_oper = {
     //.ftruncate      = dedupfs_ftruncate,
 };
 
-int main(int argc, char *argv[]) {
+/*
+**  print out current system setting
+*/
+void print_system_config(){
+    #ifdef PENDING
+        PRINT_MESSAGE("enable pending!!");
+    #endif
+    #ifdef INLINE_REWRITE
+        PRINT_MESSAGE("enable inline rewrite!!");
+    #endif
+    #ifdef CHUNK_CACHE_SIZE
+        PRINT_MESSAGE("enable chunk cache, size: " << CHUNK_CACHE_SIZE);
+    #endif
+    #if defined(CHUNK_CACHE_SIZE) && !defined(PENDING)
+        PRINT_WARNING("You have enable chunk cache, but not enable pending. This might be wrong");
+        exit(EXIT_FAILURE);
+    #endif
+}
+
+/*
+**  remove old metadata or data in BACKEND folder
+*/
+void remove_old_metadata(){
     // remove old chunk store
     struct stat info;
-    if (stat(BACKEND CHUNK_STORE, &info) != 0)
-        PRINT_MESSAGE("old chunk store not found");
-    else if (info.st_mode & S_IFDIR) {
-        PRINT_MESSAGE("found old chunk store, removing");
-        std::filesystem::remove_all(BACKEND CHUNK_STORE);
+    if (stat(BACKEND, &info) != 0 || !(info.st_mode & S_IFDIR)){
+        PRINT_WARNING("BACKEND folder not exist or is a file, consider mkdir or point BACKEND to correct folder in config.h");
+        exit(EXIT_FAILURE);
     }
     // remove every file in backend directory.
     bool has_confirm = false;
@@ -146,57 +125,40 @@ int main(int argc, char *argv[]) {
             }
             else{
                 PRINT_MESSAGE("Can not start DedupFS due to not empty backend directory");
-                return 0;
+                exit(EXIT_FAILURE);
             }
         }
         std::filesystem::remove_all(entry.path());
     }
+}
+
+/*
+**  FUSE daemon's entry point
+*/
+int main(int argc, char *argv[]) {
+    remove_old_metadata();
+    print_system_config();
     PRINT_MESSAGE("----------------------------------------entering CDCFS !!----------------------------------------");
-    #ifdef PENDING
-        PRINT_MESSAGE("enable pending!!");
-    #endif
-    #ifdef REWRITE
-        PRINT_MESSAGE("enable rewrite!!");
-        #ifdef REWRITE_DEDUP
-            PRINT_MESSAGE("enable rewrite deduplication!!");
-        #endif
-    #endif
-    #ifdef INLINE_REWRITE
-        PRINT_MESSAGE("enable inline rewrite!!");
-        #ifdef USING_REMAP
-            PRINT_MESSAGE("enable remap!!");
-        #endif
-    #endif
-    #ifdef RECORD_LATENCY
-        PRINT_MESSAGE("enable record latency!!");
-    #endif
-    #ifdef RECORD_READ_REQ
-        PRINT_MESSAGE("enable record read request!!");
-    #endif
+
     // init CDCFS data structure
     for (INUM_TYPE iNum = 0; iNum < MAX_INODE_NUM - 1; ++iNum)
-        free_iNum.insert(iNum);
+        free_iNum.push(iNum);
     for(FILE_HANDLER_INDEX_TYPE file_handler = 0; file_handler < MAX_FILE_HANDLER - 1; ++file_handler)
-        free_file_handler.insert(file_handler);
-    // build chunk store
+        free_file_handler.push(file_handler);
+
     mode_t old_mask = umask(0);  // Temporarily set umask to 0
+    // build chunk store
     mkdir(BACKEND CHUNK_STORE, 0766);
-    // build system command file
-    fuse_file_info fi;
-    dedupfs_create(COMMAND_PATH, 0666, &fi);
-    dedupfs_release(COMMAND_PATH, &fi);
     umask(old_mask); // Restore the original umask after operation
-    // init fastcdc engine
-    cdc = fastcdc_init(512, CHUNK_SIZE, MAX_GROUP_SIZE);
-    ctx = &cdc;
-    // start rewrite worker thread
+
+    // init chunker setting
+    cdc_setting = fastcdc_init(512, CHUNK_SIZE, MAX_GROUP_SIZE);
+
+    // start rewrite worker thread if enable rewrite
     #ifdef INLINE_REWRITE
-    #ifdef USING_REMAP
     rewrite_thread = std::thread(remap_rewrite_worker);
-    #else
-    rewrite_thread = std::thread(inline_rewrite_worker);
     #endif
-    #endif
-    // start FUSE daemon
+
+    // start FUSE service(lazy way)
     return fuse_main(argc, argv, &dedupfs_oper, NULL);
 }
