@@ -104,7 +104,7 @@ inline int internal_read(INUM_TYPE iNum, int fh, char *buf, size_t size, off_t o
     end_group_idx -= 1;
     if (end_group_idx > mapping_table[iNum].completed_link){
         PRINT_WARNING("[warning] trying to read unreferenced group, group_idx: " << end_group_idx);
-        return 0;
+        return -1;
     }
     // 3. find smallest need to read area
     off_t end_gap = mapping_table[iNum].group_logical_offset[end_group_idx] + mapping_table[iNum].group_pos[end_group_idx]->length - end_off;
@@ -215,7 +215,7 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
             size_t sub_io = 0, sub_real_io = 0;
             int sub_ret = internal_read(iNum, virtual_file_read_fh[iNum], buf + (cur_off - offset), normal_read_end - cur_off, cur_off, sub_io, sub_real_io);
             internal_read_count_this_round += 1;
-            if (sub_ret == 0) {
+            if (sub_ret == -1) {
                 PRINT_WARNING("Critical Error: internal read failed");
                 return ret;
             }
@@ -228,9 +228,9 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     if (internal_read_count_this_round != 0 && remap_pread_count_this_round != 0) [[unlikely]] PRINT_WARNING("Warning: do nomal read && remap read in the same request");
     #else
     ret = internal_read(iNum, virtual_file_read_fh[iNum], buf, size, offset, io_size, real_io_size);
-    if (ret == 0){
+    if (ret == -1){
         PRINT_WARNING("Critical Error: internal read failed");
-        return ret;
+        return 0;
     }
     #endif
     // 3. record read hotness of each page
