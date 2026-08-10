@@ -248,7 +248,7 @@ inline int internal_read(INUM_TYPE iNum, int fh, char *buf, size_t size, off_t o
     off_t io_start = OFF_T_MAX, io_end = 0;
     for (GROUP_IDX_TYPE i = start_group_idx; i <= cur_group_idx; i++){
         off_t group_start = mapping_table[iNum].group_virtual_offset[i];
-        off_t group_end = group_start + mapping_table[iNum].group_pos[cur_group_idx]->length;
+        off_t group_end = group_start + mapping_table[iNum].group_pos[i]->length;
         if (i == start_group_idx) group_start += front_gap;
         if (i == cur_group_idx) group_end -= end_gap;
         io_start = std::min(io_start, group_start);
