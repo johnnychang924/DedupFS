@@ -82,7 +82,7 @@ static int dedupfs_open(const char *path, struct fuse_file_info *fi) {
 // for dedupfs internal read
 inline int internal_read(INUM_TYPE iNum, int fh, char *buf, size_t size, off_t offset, size_t &io_size, size_t &real_io_size){
     std::shared_lock<std::shared_mutex> read_lock(mapping_table_mutex[iNum]);
-    // find first block group index
+    // 1. find start group index
     GROUP_IDX_TYPE start_group_idx = mapping_table[iNum].group_idx[offset / CHUNK_SIZE];
     while (true) {
         off_t cur_group_offset = mapping_table[iNum].group_logical_offset[start_group_idx];
@@ -94,178 +94,152 @@ inline int internal_read(INUM_TYPE iNum, int fh, char *buf, size_t size, off_t o
         if (start_group_idx < 0 || start_group_idx >= mapping_table[iNum].group_pos.size()) return 0;   // It should not happen
     }
     DEBUG_MESSAGE("  start block: " << start_group_idx);
-    // find need to read range
+    // 2. find need to read group
     off_t end_off = offset + size;
     off_t front_gap = offset - mapping_table[iNum].group_logical_offset[start_group_idx];
-    if (start_group_idx > mapping_table[iNum].completed_link){
-        PRINT_WARNING("[warning] trying to read unreferenced group, group_idx: " << start_group_idx);
+    GROUP_IDX_TYPE end_group_idx = start_group_idx;     // inclusive
+    while(end_group_idx < mapping_table[iNum].group_logical_offset.size() && 
+                mapping_table[iNum].group_logical_offset[end_group_idx] < end_off)
+        end_group_idx++;
+    end_group_idx -= 1;
+    if (end_group_idx > mapping_table[iNum].completed_link){
+        PRINT_WARNING("[warning] trying to read unreferenced group, group_idx: " << end_group_idx);
         return 0;
     }
-    // off_t io_off = (mapping_table[iNum].group_virtual_offset[start_group_idx] + front_gap) / SECTOR_SIZE * SECTOR_SIZE;
-    // just for validate
-    // real_io_size = mapping_table[iNum].group_virtual_offset[start_group_idx] + front_gap;
-    GROUP_IDX_TYPE cur_group_idx = start_group_idx;
-    while(cur_group_idx < mapping_table[iNum].group_logical_offset.size() && 
-                mapping_table[iNum].group_logical_offset[cur_group_idx] < end_off)
-        cur_group_idx++;
-    cur_group_idx -= 1;
-    if (cur_group_idx > mapping_table[iNum].completed_link){
-        PRINT_WARNING("[warning] trying to read unreferenced group, group_idx: " << start_group_idx);
-        return 0;
-    }
-
-    off_t end_gap = mapping_table[iNum].group_logical_offset[cur_group_idx] + mapping_table[iNum].group_pos[cur_group_idx]->length - end_off;
-    if (end_gap < 0) end_gap = 0;   // end_off might bigger than logical file size
-    // find smallest need to read area
-    off_t io_start = OFF_T_MAX, io_end = 0;
-    for (GROUP_IDX_TYPE i = start_group_idx; i <= cur_group_idx; i++){
-        off_t group_start = mapping_table[iNum].group_virtual_offset[i];
+    // 3. find smallest need to read area
+    off_t end_gap = mapping_table[iNum].group_logical_offset[end_group_idx] + mapping_table[iNum].group_pos[end_group_idx]->length - end_off;
+    if (end_gap < 0) end_gap = 0;   // end_off might bigger than logical file size which make end_gap < 0
+    off_t smallest_io_start = OFF_T_MAX, smallest_io_end = 0;
+    for (GROUP_IDX_TYPE cur_group_idx = start_group_idx; cur_group_idx <= end_group_idx; cur_group_idx++){
+        off_t group_start = mapping_table[iNum].group_virtual_offset[cur_group_idx];
         off_t group_end = group_start + mapping_table[iNum].group_pos[cur_group_idx]->length;
-        if (i == start_group_idx) group_start += front_gap;
-        if (i == cur_group_idx) group_end -= end_gap;
-        io_start = std::min(io_start, group_start);
-        io_end = std::max(io_end, group_end);
+        if (cur_group_idx == start_group_idx) group_start += front_gap;
+        if (cur_group_idx == end_group_idx) group_end -= end_gap;
+        smallest_io_start = std::min(smallest_io_start, group_start);
+        smallest_io_end = std::max(smallest_io_end, group_end);
     }
-    real_io_size = io_end - io_start;
-    if (io_end < io_start) [[unlikely]] PRINT_WARNING("io_end < io_start" << io_end << ", " << io_start);
-    off_t io_off = io_start / SECTOR_SIZE * SECTOR_SIZE;
-    io_size = (io_end + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE - io_off;
-
-    //io_size = mapping_table[iNum].group_virtual_offset[cur_group_idx] + (off_t)mapping_table[iNum].group_pos[cur_group_idx]->length - end_gap - io_off;
-    //io_size = (io_size + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE;  // allign with page
-
-    // just for validate
-    // real_io_size = mapping_table[iNum].group_virtual_offset[cur_group_idx] + (off_t)mapping_table[iNum].group_pos[cur_group_idx]->length - end_gap - real_io_size;
-    // PRINT_WARNING("real_io_size: " << real_io_size << " io_start: " << io_start << " io_end: " << io_end);
-    
-    // read into temp buffer
-    // char tmp_buf[io_size];
+    real_io_size = smallest_io_end - smallest_io_start;
+    if (smallest_io_end < smallest_io_start) [[unlikely]] PRINT_WARNING("io_end < io_start" << smallest_io_end << ", " << smallest_io_start);
+    off_t io_off = smallest_io_start / SECTOR_SIZE * SECTOR_SIZE;
+    io_size = (smallest_io_end + SECTOR_SIZE - 1) / SECTOR_SIZE * SECTOR_SIZE - io_off;
     char *tmp_buf;
     if (posix_memalign((void**)&tmp_buf, 4096, io_size) != 0){
         PRINT_WARNING("posix_memalign failed!!!!");
         return -1;
     }
-    //auto tmp_buf_chunk = std::unique_ptr<char, decltype(&free)>(
-    //    (char *)aligned_alloc(SECTOR_SIZE, io_size), free);
-    //if (!tmp_buf_chunk) return -ENOMEM;
-    //char *tmp_buf = tmp_buf_chunk.get();
+    // 4. read data into tmp buffer
     DEBUG_MESSAGE("  start reading offset->" << io_off << " size->" << io_size);
     int res = pread(virtual_file_read_fh[iNum], tmp_buf, io_size, io_off);
-    if ((size_t)res != io_size){
+    if ((size_t)res != io_size) [[unlikely]]{
         PRINT_WARNING("Can not read enough chunk from virtual file, should read " << io_size << ", but " << res);
     }
-    // fill in return buffer
-    int less = size;
-    char *cur_buf_ptr = buf;
-    cur_group_idx = start_group_idx;
-    front_gap = offset - mapping_table[iNum].group_logical_offset[start_group_idx];
-    DEBUG_MESSAGE("  filling return buffer");
-    while(less > 0){
-        size_t cp_size = std::min(mapping_table[iNum].group_pos[cur_group_idx]->length - (size_t)front_gap, (size_t)less);
-        off_t tmp_buf_off = mapping_table[iNum].group_virtual_offset[cur_group_idx] - io_off + front_gap;
-        // if (tmp_buf_off < 0 || tmp_buf_off + cp_size > io_size) PRINT_WARNING("read outside of buffer " << io_size << ", " << tmp_buf_off << ", " << cp_size);
-        DEBUG_MESSAGE("    cur_group->" << cur_group_idx << " front_gap->" << front_gap << " cp_size->" << cp_size << " group_offset->" << mapping_table[iNum].group_virtual_offset[cur_group_idx] << " group_size->" << mapping_table[iNum].group_pos[cur_group_idx]->length << " tmp_buffer_offset->" << tmp_buf_off);
-        memcpy(cur_buf_ptr, tmp_buf + tmp_buf_off, cp_size);
-        less -= cp_size;
-        if (cur_group_idx == mapping_table[iNum].group_pos.size()-1) break;
-        cur_buf_ptr += cp_size;
-        cur_group_idx++;
-        front_gap = 0;
+    // 5. fill in return buffer
+    size_t fillin_size = 0;
+    for (GROUP_IDX_TYPE cur_group_idx = start_group_idx; cur_group_idx <= end_group_idx && fillin_size < size; cur_group_idx++){
+        size_t copy_size = mapping_table[iNum].group_pos[cur_group_idx]->length;
+        if (cur_group_idx == start_group_idx) copy_size -= front_gap;
+        if (cur_group_idx == end_group_idx) copy_size -= end_gap;
+        off_t copy_start = mapping_table[iNum].group_virtual_offset[cur_group_idx] - io_off;
+        if (cur_group_idx == start_group_idx) copy_start += front_gap;
+        memcpy(buf + fillin_size, tmp_buf + copy_start, copy_size);
+        fillin_size += copy_size;
     }
     free(tmp_buf);
-    return size - std::max(less, 0);
+    return fillin_size;
 }
 
 static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi){
     DEBUG_MESSAGE("[read]" << path << " offset: " << offset << " size: " << size);
     
     INUM_TYPE iNum = file_handler[fi->fh].iNum;
+    size_t real_io_size = 0, io_size = 0;
+    int ret = 0;    // how many bytes have been written into buf
     if ((size_t)offset > mapping_table[iNum].logical_size || size == 0) return 0;
-    size_t real_io_size = 0;
-    size_t io_size = 0;
-    int ret;
+    
     #if defined(INLINE_REWRITE)
-    int local_remap_pread_count = 0;
+    int remap_pread_count_this_round = 0, internal_read_count_this_round = 0;
+    off_t end = std::min(offset + (off_t)size, (off_t)mapping_table[iNum].logical_size);
+    off_t start = offset / SECTOR_SIZE * SECTOR_SIZE;
+    std::vector<std::pair<off_t, off_t>> snapshot;
+    snapshot.reserve((end - start + SECTOR_SIZE - 1) / SECTOR_SIZE);
+    // 1. find out the page which is in remap table(store in snapshot);
     {
-        off_t end = std::min(offset + (off_t)size, (off_t)mapping_table[iNum].logical_size);
-        // snapshot in-range remap entries, then release the lock immediately
-        std::vector<std::pair<off_t, off_t>> snapshot;
-        snapshot.reserve(((end - offset / SECTOR_SIZE * SECTOR_SIZE) + SECTOR_SIZE - 1) / SECTOR_SIZE);
-        {
-            std::shared_lock<std::shared_mutex> remap_lock(mapping_table_remap_mutex[iNum]);
-            auto& remap = mapping_table[iNum].remap;
-            for (off_t pg = (offset / SECTOR_SIZE) * SECTOR_SIZE; pg < end; pg += SECTOR_SIZE) {
-                auto it = remap.find(pg);
-                if (it != remap.end()) snapshot.emplace_back(pg, it->second);
-            }
+        std::shared_lock<std::shared_mutex> remap_lock(mapping_table_remap_mutex[iNum]);
+        auto& remap_table = mapping_table[iNum].remap;
+        for (off_t pg = (offset / SECTOR_SIZE) * SECTOR_SIZE; pg < end; pg += SECTOR_SIZE) {
+            auto it = remap_table.find(pg);
+            if (it != remap_table.end()) snapshot.emplace_back(pg, it->second);
         }
-        int total_read = 0;
-        size_t snap_idx = 0;
-        off_t cur = offset;
-        while (cur < end) {
-            off_t page_off = cur / SECTOR_SIZE * SECTOR_SIZE;
-            if (snap_idx < snapshot.size() && snapshot[snap_idx].first == page_off) {
-                // remapped run: extend while contiguous in both logical and physical space
-                off_t run_logical_start = page_off;
-                off_t run_src_start = snapshot[snap_idx].second;
-                size_t run_pages = 1;
-                while (snap_idx + run_pages < snapshot.size() &&
-                       snapshot[snap_idx + run_pages].first == run_logical_start + (off_t)(run_pages * SECTOR_SIZE) &&
-                       snapshot[snap_idx + run_pages].second == run_src_start + (off_t)(run_pages * SECTOR_SIZE)) {
-                    ++run_pages;
-                }
-                off_t run_logical_end = run_logical_start + (off_t)(run_pages * SECTOR_SIZE);
-                off_t in_run_offset = cur - run_logical_start;
-                size_t copy_size = std::min(run_logical_end, end) - cur;
-                char *tmp_buf;
-                if (posix_memalign((void**)&tmp_buf, 4096, copy_size) != 0){
-                    PRINT_WARNING("posix_memalign failed!!!!");
-                    return -1;
-                }
-                int res = pread(rewrite_read_fh, tmp_buf, copy_size, run_src_start + in_run_offset);
-                if (copy_size % 4096 != 0 || (run_src_start + in_run_offset) % 4096 != 0) [[unlikely]] PRINT_WARNING("Can not use direct I/O");
-                memcpy(buf + (cur - offset), tmp_buf, copy_size);
-                free(tmp_buf);
-                local_remap_pread_count += 1;
-                if ((size_t)res != copy_size) [[unlikely]] {
-                    PRINT_WARNING("remap pread failed: read " << res << " expected " << copy_size);
-                    return 0;
-                }
-                io_size += copy_size;
-                real_io_size += copy_size;
-                total_read += copy_size;
-                cur += copy_size;
-                snap_idx += run_pages;
-            } else {
-                // non-remapped run: defer to internal_read up to next remapped page (or end)
-                off_t next_remap = (snap_idx < snapshot.size()) ? snapshot[snap_idx].first : end;
-                off_t run_end = std::min(next_remap, end);
-                size_t sub_io = 0, sub_real_io = 0;
-                int sub_ret = internal_read(iNum, virtual_file_read_fh[iNum],
-                                            buf + (cur - offset),
-                                            run_end - cur, cur, sub_io, sub_real_io);
-                if (sub_ret == 0) return 0;
-                io_size += sub_io;
-                real_io_size += sub_real_io;
-                total_read += sub_ret;
-                cur = run_end;
-            }
-            if (cur < end)[[unlikely]] PRINT_WARNING("Read didn't complete after one round");
-        }
-        ret = total_read;
     }
+    // 2. read out every page which is needed
+    off_t cur_off = offset;
+    auto snapshot_it = snapshot.begin();
+    while(cur_off < end){
+        off_t page_off = cur_off / SECTOR_SIZE * SECTOR_SIZE;
+        off_t page_physical_off = snapshot_it != snapshot.end() ? snapshot_it->second: 0;
+        size_t cur_remap_read_size = 0;
+        // concat the page in remap table if they logically && physically continue
+        while(snapshot_it != snapshot.end() &&
+                snapshot_it->first == (off_t)(page_off + cur_remap_read_size) &&
+                snapshot_it->second == (off_t)(page_physical_off + cur_remap_read_size)){
+            cur_remap_read_size += SECTOR_SIZE;
+            snapshot_it += 1;
+        }
+        // read out the page in remap table
+        if (cur_remap_read_size != 0){
+            char *tmp_buf;
+            // for direct I/O
+            if (posix_memalign((void**)&tmp_buf, 4096, cur_remap_read_size) != 0){
+                PRINT_WARNING("posix_memalign failed!!!!");
+                return -1;
+            }
+            if (cur_remap_read_size % 4096 != 0 || page_physical_off % 4096 != 0) [[unlikely]] PRINT_WARNING("Can not use direct I/O");
+            if (pread(rewrite_read_fh, tmp_buf, cur_remap_read_size, page_physical_off) != (ssize_t)cur_remap_read_size){
+                PRINT_WARNING("Critical Error: remap read failed");
+                free(tmp_buf);
+                return ret;
+            }
+            remap_pread_count_this_round += 1;
+            off_t front_gap = cur_off - page_off;
+            size_t copy_size = std::min(cur_remap_read_size - front_gap, (size_t)end - cur_off);
+            memcpy(buf + (cur_off - offset), tmp_buf+front_gap, copy_size);
+            ret += copy_size;
+            cur_off += copy_size;
+            io_size += cur_remap_read_size; // pread size
+            real_io_size += copy_size;      // real needed size
+            free(tmp_buf);
+        }
+        // read out the less page by normal internal_read
+        off_t normal_read_end = snapshot_it == snapshot.end() ? end : snapshot_it->first;
+        if (normal_read_end - cur_off != 0){
+            size_t sub_io = 0, sub_real_io = 0;
+            int sub_ret = internal_read(iNum, virtual_file_read_fh[iNum], buf + (cur_off - offset), normal_read_end - cur_off, cur_off, sub_io, sub_real_io);
+            internal_read_count_this_round += 1;
+            if (sub_ret == 0) {
+                PRINT_WARNING("Critical Error: internal read failed");
+                return ret;
+            }
+            cur_off = normal_read_end;
+            io_size += sub_io;
+            real_io_size += sub_real_io;
+            ret += sub_ret;
+        }
+    }
+    if (internal_read_count_this_round != 0 && remap_pread_count_this_round != 0) [[unlikely]] PRINT_WARNING("Warning: do nomal read && remap read in the same request");
     #else
     ret = internal_read(iNum, virtual_file_read_fh[iNum], buf, size, offset, io_size, real_io_size);
+    if (ret == 0){
+        PRINT_WARNING("Critical Error: internal read failed");
+        return ret;
+    }
     #endif
-    if (ret == 0)
-        return ret;     // something went wrong, return the process to prevent more system damage
-    
+    // 3. record read hotness of each page
     #if defined(INLINE_REWRITE)
     if (io_size != size && running) {
         float min_score = std::numeric_limits<float>::max();
         for (off_t LPA = offset / SECTOR_SIZE; LPA < (offset + (off_t)size + SECTOR_SIZE - 1) / SECTOR_SIZE; LPA++)
             min_score = std::min(min_score, freq_tracker.read(iNum, LPA));
-        float extra_read_pages = (float)(io_size - size) / SECTOR_SIZE;
+        float extra_read_pages = io_size > size ? (float)(io_size - size) / SECTOR_SIZE : 0;
         if (min_score * extra_read_pages > INLINE_REWRITE_THRESHOLD) {
             // phase 1: build rewrite requests under mapping table shared lock only
             std::vector<rewrite_req_struct> pending;
@@ -276,13 +250,6 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
                     off_t page_offset = LPA * SECTOR_SIZE;
                     off_t buf_off = page_offset - offset;
                     if (buf_off < 0 || buf_off + SECTOR_SIZE > offset + (off_t)size) continue;
-                    // skip pages that are already sector-aligned in the virtual file
-                    // (reading them causes no amplification, so rewriting them is unnecessary)
-                    /*GROUP_IDX_TYPE gidx = mapping_table[iNum].group_idx[LPA];
-                    off_t front_gap = page_offset - mapping_table[iNum].group_logical_offset[gidx];
-                    off_t virt_start = mapping_table[iNum].group_virtual_offset[gidx] + front_gap;
-                    if ((size_t)front_gap + SECTOR_SIZE <= mapping_table[iNum].group_pos[gidx]->length
-                        && virt_start % SECTOR_SIZE == 0) continue;*/
                     rewrite_req_struct req;
                     req.iNum = iNum;
                     req.logical_offset = page_offset;
@@ -290,7 +257,7 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
                     pending.push_back(std::move(req));
                 }
             }
-            // phase 2: push to queue under exclusive lock (brief critical section)
+            // phase 2: push to rewrite queue
             if (!pending.empty()) {
                 {
                     std::unique_lock<std::shared_mutex> queue_lock(rewrite_queue_mutex);
@@ -308,9 +275,9 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
         }
     }
     #endif
-    if (real_io_size > io_size) [[unlikely]] PRINT_WARNING("ERROR: io_size > real_io_size" << io_size << ", " << real_io_size);
+    if (real_io_size > io_size) [[unlikely]] PRINT_WARNING("ERROR: real_io_size > io_size" << io_size << ", " << real_io_size);
 
-    // record fs read information
+    // 4. record fs read information
     std::unique_lock<std::shared_mutex> unique_read_record_lock(read_record_mutex);
     host_read_size += std::abs((off_t)std::min(offset + size, mapping_table[iNum].logical_size) - offset);
     fuse_read_size += io_size;
@@ -318,11 +285,11 @@ static int dedupfs_read(const char *path, char *buf, size_t size, off_t offset, 
     else if (io_size > size && real_io_size <= size) read_req_misalign += 1;
     else read_req_frag += 1;
     #if defined(INLINE_REWRITE)
-    remap_pread_count += local_remap_pread_count;
-    if (local_remap_pread_count != 0) remap_req_count += 1;
+    remap_pread_count += remap_pread_count_this_round;
+    if (remap_pread_count_this_round != 0) remap_req_count += 1;
     #endif
     unique_read_record_lock.unlock();
-
+    // 5. return
     return ret;
 }
 
